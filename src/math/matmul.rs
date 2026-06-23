@@ -5,7 +5,29 @@
 //! `[cols, rows]`, but the bytes are row-major). So row `m` is the contiguous
 //! slice `w[m*cols .. (m+1)*cols]`.
 //!
-//! M2: a correct, rayon-parallel f32 implementation. M5: SIMD + tiling.
+//! M2: a correct, rayon-parallel f32 implementation. M5: 8-wide SIMD dot.
+
+use wide::f32x8;
+
+/// Dot product of two equal-length slices, vectorized 8 lanes at a time with a
+/// scalar tail. The inference hot path for both F32 and dequantized rows.
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = f32x8::ZERO;
+    let mut ai = a.chunks_exact(8);
+    let mut bi = b.chunks_exact(8);
+    for (ca, cb) in ai.by_ref().zip(bi.by_ref()) {
+        let va = f32x8::from(<[f32; 8]>::try_from(ca).unwrap());
+        let vb = f32x8::from(<[f32; 8]>::try_from(cb).unwrap());
+        acc = va.mul_add(vb, acc);
+    }
+    let mut sum = acc.reduce_add();
+    for (&x, &y) in ai.remainder().iter().zip(bi.remainder()) {
+        sum += x * y;
+    }
+    sum
+}
 
 /// `out[m] = sum_k w[m*cols + k] * x[k]` for m in 0..rows.
 /// `w.len() == rows*cols`, `x.len() == cols`, `out.len() == rows`.
@@ -13,9 +35,7 @@ pub fn matvec(w: &[f32], x: &[f32], out: &mut [f32], _rows: usize, cols: usize) 
     use rayon::prelude::*;
     out.par_iter_mut()
         .zip(w.par_chunks(cols))
-        .for_each(|(o, row)| {
-            *o = row.iter().zip(x).map(|(&wv, &xv)| wv * xv).sum();
-        });
+        .for_each(|(o, row)| *o = dot(row, x));
 }
 
 #[cfg(test)]
