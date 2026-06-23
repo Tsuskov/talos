@@ -12,7 +12,6 @@ use std::path::Path;
 
 use crate::gguf::GgufFile;
 use crate::kv_cache::KvCache;
-use crate::math::matmul::matvec;
 use crate::math::ops::{rmsnorm, rope, softmax, swiglu};
 use crate::model::{Config, Weights};
 use crate::tokenizer::Tokenizer;
@@ -56,7 +55,8 @@ impl Model {
         let scale = 1.0 / (hd as f32).sqrt();
 
         // Residual stream, initialized to the token embedding.
-        let mut x = w.token_embd[token as usize * c..(token as usize + 1) * c].to_vec();
+        let mut x = vec![0.0f32; c];
+        w.token_embd.dequant_row(token as usize, &mut x);
 
         let mut normed = vec![0.0f32; c];
         for (l, lw) in w.layers.iter().enumerate() {
@@ -66,9 +66,9 @@ impl Model {
             let mut q = vec![0.0f32; c];
             let mut k = vec![0.0f32; c];
             let mut v = vec![0.0f32; c];
-            matvec(lw.attn_q, &normed, &mut q, c, c);
-            matvec(lw.attn_k, &normed, &mut k, c, c);
-            matvec(lw.attn_v, &normed, &mut v, c, c);
+            lw.attn_q.matvec(&normed, &mut q);
+            lw.attn_k.matvec(&normed, &mut k);
+            lw.attn_v.matvec(&normed, &mut v);
 
             rope(&mut q, pos, nh, hd, cfg.rope_freq_base);
             rope(&mut k, pos, nh, hd, cfg.rope_freq_base);
@@ -99,7 +99,7 @@ impl Model {
             }
 
             let mut attproj = vec![0.0f32; c];
-            matvec(lw.attn_output, &atty, &mut attproj, c, c);
+            lw.attn_output.matvec(&atty, &mut attproj);
             for (xi, &a) in x.iter_mut().zip(&attproj) {
                 *xi += a;
             }
@@ -109,12 +109,12 @@ impl Model {
             let f = cfg.n_ff;
             let mut gate = vec![0.0f32; f];
             let mut up = vec![0.0f32; f];
-            matvec(lw.ffn_gate, &normed, &mut gate, f, c);
-            matvec(lw.ffn_up, &normed, &mut up, f, c);
+            lw.ffn_gate.matvec(&normed, &mut gate);
+            lw.ffn_up.matvec(&normed, &mut up);
             let mut glu = vec![0.0f32; f];
             swiglu(&gate, &up, &mut glu);
             let mut down = vec![0.0f32; c];
-            matvec(lw.ffn_down, &glu, &mut down, c, f);
+            lw.ffn_down.matvec(&glu, &mut down);
             for (xi, &d) in x.iter_mut().zip(&down) {
                 *xi += d;
             }
@@ -124,7 +124,7 @@ impl Model {
         let mut xf = vec![0.0f32; c];
         rmsnorm(&x, w.output_norm, eps, &mut xf);
         let mut logits = vec![0.0f32; cfg.vocab_size];
-        matvec(w.output, &xf, &mut logits, cfg.vocab_size, c);
+        w.output.matvec(&xf, &mut logits);
         logits
     }
 

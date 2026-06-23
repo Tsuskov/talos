@@ -7,3 +7,4 @@
 
 pub mod matmul;
 pub mod ops;
+pub mod quant;

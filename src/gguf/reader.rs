@@ -278,6 +278,33 @@ impl GgufFile {
         }
         Ok(bytemuck::cast_slice(&self._mmap[start..end]))
     }
+
+    /// Raw tensor bytes plus dtype, for any supported type (F32 or quantized).
+    /// Byte length is `block_bytes · elem_count / block_elems`.
+    pub fn tensor_raw(&self, name: &str) -> Result<(&[u8], GgmlType)> {
+        let info = self
+            .tensor_info(name)
+            .ok_or_else(|| anyhow!("no tensor named {name:?}"))?;
+        let elems = info.elem_count();
+        let blk = info.dtype.block_elems();
+        if elems % blk != 0 {
+            bail!("tensor {name:?} has {elems} elems, not a multiple of block {blk}");
+        }
+        let byte_len = (elems / blk)
+            .checked_mul(info.dtype.block_bytes())
+            .ok_or_else(|| anyhow!("tensor byte length overflow"))?;
+        let start = self
+            .data_start
+            .checked_add(info.offset as usize)
+            .ok_or_else(|| anyhow!("tensor offset overflow"))?;
+        let end = start
+            .checked_add(byte_len)
+            .ok_or_else(|| anyhow!("tensor byte range overflow"))?;
+        if end > self._mmap.len() {
+            bail!("tensor {name:?} data range past end of file");
+        }
+        Ok((&self._mmap[start..end], info.dtype))
+    }
 }
 
 #[cfg(test)]
