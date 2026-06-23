@@ -1,13 +1,18 @@
 //! Talos CLI. Owner: lead.
 //!
-//!   talos inspect <model.gguf>          — print metadata + tensor index (M0)
-//!   talos run <model.gguf> --prompt "…" [-n N] [--temp T] [--top-k K] [--top-p P]
+//!   talos inspect <model.gguf>
+//!   talos run <model.gguf> --prompt "…" [-n N] [--temp T] [--top-k K] [--top-p P] [--seed S]
 
+use std::io::Write;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context, Result};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 
 use talos::gguf::GgufFile;
+use talos::model::Model;
+use talos::sample::sample;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -16,15 +21,12 @@ fn main() -> Result<()> {
             let path = args.get(1).map(Path::new).ok_or_else(usage_err)?;
             inspect(path)
         }
-        Some("run") => {
-            // Wired up in M2/M3 once Model::forward and sampling land.
-            todo!("run: load model, encode prompt, decode loop, stream tokens")
-        }
+        Some("run") => run(&args[1..]),
         _ => Err(usage_err()),
     }
 }
 
-/// `talos inspect` — usable as soon as the GGUF reader (M0) lands.
+/// `talos inspect` — print metadata + tensor index.
 fn inspect(path: &Path) -> Result<()> {
     let g = GgufFile::open(path)?;
     println!("# tensors");
@@ -34,6 +36,102 @@ fn inspect(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `talos run` — load a model, encode the prompt, and stream a continuation.
+fn run(args: &[String]) -> Result<()> {
+    let model_path = args.first().ok_or_else(usage_err)?;
+    let opts = Opts::parse(&args[1..])?;
+    let prompt = opts.prompt.as_deref().ok_or_else(|| anyhow!("--prompt is required"))?;
+
+    let mut model = Model::load(Path::new(model_path))?;
+    let mut rng = StdRng::seed_from_u64(opts.seed.unwrap_or_else(rand::random));
+
+    let prompt_ids = model.tokenizer.encode(prompt);
+    if prompt_ids.is_empty() {
+        bail!("prompt encoded to zero tokens");
+    }
+
+    let mut stdout = std::io::stdout();
+    print!("{prompt}");
+    stdout.flush().ok();
+
+    // Prefill: feed the prompt, keeping the logits after the last token.
+    model.reset();
+    let mut pos = 0usize;
+    let mut logits = Vec::new();
+    for &t in &prompt_ids {
+        logits = model.forward(t, pos);
+        pos += 1;
+    }
+
+    // Decode loop.
+    let eos = model.tokenizer.eos();
+    let mut out_ids = Vec::new();
+    let mut printed = 0usize;
+    for _ in 0..opts.n {
+        if pos >= model.cfg.context_length {
+            break;
+        }
+        let next = sample(&logits, opts.temp, opts.top_k, opts.top_p, &mut rng);
+        if next == eos {
+            break;
+        }
+        out_ids.push(next);
+        printed = flush_new(&model.tokenizer.decode(&out_ids), printed, &mut stdout);
+        logits = model.forward(next, pos);
+        pos += 1;
+    }
+    println!();
+    Ok(())
+}
+
+/// Print whatever decoded text is newly complete since `printed` chars, holding
+/// back a trailing replacement char (an incomplete multibyte sequence) until the
+/// next token completes it. Returns the new printed-char count.
+fn flush_new(text: &str, printed: usize, out: &mut impl Write) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let end = if chars.last() == Some(&'\u{FFFD}') {
+        chars.len().saturating_sub(1)
+    } else {
+        chars.len()
+    };
+    for c in &chars[printed.min(end)..end] {
+        print!("{c}");
+    }
+    out.flush().ok();
+    end
+}
+
+struct Opts {
+    prompt: Option<String>,
+    n: usize,
+    temp: f32,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    seed: Option<u64>,
+}
+
+impl Opts {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut o = Opts { prompt: None, n: 64, temp: 0.8, top_k: None, top_p: None, seed: None };
+        let mut it = args.iter();
+        while let Some(flag) = it.next() {
+            let mut val = || it.next().ok_or_else(|| anyhow!("{flag} needs a value"));
+            match flag.as_str() {
+                "--prompt" | "-p" => o.prompt = Some(val()?.clone()),
+                "-n" | "--tokens" => o.n = val()?.parse().context("-n")?,
+                "--temp" => o.temp = val()?.parse().context("--temp")?,
+                "--top-k" => o.top_k = Some(val()?.parse().context("--top-k")?),
+                "--top-p" => o.top_p = Some(val()?.parse().context("--top-p")?),
+                "--seed" => o.seed = Some(val()?.parse().context("--seed")?),
+                other => bail!("unknown option {other}"),
+            }
+        }
+        Ok(o)
+    }
+}
+
 fn usage_err() -> anyhow::Error {
-    anyhow::anyhow!("usage: talos <inspect|run> <model.gguf> [options]")
+    anyhow::anyhow!(
+        "usage:\n  talos inspect <model.gguf>\n  talos run <model.gguf> --prompt \"…\" [-n N] [--temp T] [--top-k K] [--top-p P] [--seed S]"
+    )
 }
