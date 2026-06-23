@@ -30,7 +30,26 @@ pub struct Weights<'a> {
 }
 
 impl<'a> Weights<'a> {
-    pub fn from_gguf(_g: &'a GgufFile, _cfg: &Config) -> Result<Self> {
-        todo!("M2: bind tensor_f32 views by name for each layer")
+    pub fn from_gguf(g: &'a GgufFile, cfg: &Config) -> Result<Self> {
+        let mut layers = Vec::with_capacity(cfg.n_layer);
+        for l in 0..cfg.n_layer {
+            layers.push(LayerWeights {
+                attn_norm: g.tensor_f32(&format!("blk.{l}.attn_norm.weight"))?,
+                attn_q: g.tensor_f32(&format!("blk.{l}.attn_q.weight"))?,
+                attn_k: g.tensor_f32(&format!("blk.{l}.attn_k.weight"))?,
+                attn_v: g.tensor_f32(&format!("blk.{l}.attn_v.weight"))?,
+                attn_output: g.tensor_f32(&format!("blk.{l}.attn_output.weight"))?,
+                ffn_norm: g.tensor_f32(&format!("blk.{l}.ffn_norm.weight"))?,
+                ffn_gate: g.tensor_f32(&format!("blk.{l}.ffn_gate.weight"))?,
+                ffn_up: g.tensor_f32(&format!("blk.{l}.ffn_up.weight"))?,
+                ffn_down: g.tensor_f32(&format!("blk.{l}.ffn_down.weight"))?,
+            });
+        }
+        Ok(Weights {
+            token_embd: g.tensor_f32("token_embd.weight")?,
+            output_norm: g.tensor_f32("output_norm.weight")?,
+            output: g.tensor_f32("output.weight")?,
+            layers,
+        })
     }
 }
