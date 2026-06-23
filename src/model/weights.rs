@@ -70,14 +70,14 @@ pub struct Weights<'a> {
 
 impl<'a> Weights<'a> {
     pub fn from_gguf(g: &'a GgufFile, cfg: &Config) -> Result<Self> {
-        let (c, ff, v) = (cfg.n_embd, cfg.n_ff, cfg.vocab_size);
+        let (c, ff, v, kv) = (cfg.n_embd, cfg.n_ff, cfg.vocab_size, cfg.kv_dim());
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for l in 0..cfg.n_layer {
             layers.push(LayerWeights {
                 attn_norm: g.tensor_f32(&format!("blk.{l}.attn_norm.weight"))?,
                 attn_q: QTensor::bind(g, &format!("blk.{l}.attn_q.weight"), c, c)?,
-                attn_k: QTensor::bind(g, &format!("blk.{l}.attn_k.weight"), c, c)?,
-                attn_v: QTensor::bind(g, &format!("blk.{l}.attn_v.weight"), c, c)?,
+                attn_k: QTensor::bind(g, &format!("blk.{l}.attn_k.weight"), kv, c)?,
+                attn_v: QTensor::bind(g, &format!("blk.{l}.attn_v.weight"), kv, c)?,
                 attn_output: QTensor::bind(g, &format!("blk.{l}.attn_output.weight"), c, c)?,
                 ffn_norm: g.tensor_f32(&format!("blk.{l}.ffn_norm.weight"))?,
                 ffn_gate: QTensor::bind(g, &format!("blk.{l}.ffn_gate.weight"), ff, c)?,

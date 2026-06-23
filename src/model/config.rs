@@ -29,6 +29,12 @@ impl Config {
         self.n_embd / self.n_head
     }
 
+    /// Combined width of the K (or V) projection: `n_head_kv · head_dim`.
+    /// Equals `n_embd` for plain multi-head attention.
+    pub fn kv_dim(&self) -> usize {
+        self.n_head_kv * self.head_dim()
+    }
+
     /// Read all hyperparameters from a loaded GGUF file. (vocab_size from the
     /// tokenizer.ggml.tokens length.)
     pub fn from_gguf(g: &GgufFile) -> Result<Self> {

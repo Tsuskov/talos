@@ -28,11 +28,11 @@ impl Model {
     pub fn load(path: &Path) -> Result<Self> {
         let gguf = GgufFile::open(path)?;
         let cfg = Config::from_gguf(&gguf)?;
-        if cfg.n_head_kv != cfg.n_head {
+        if cfg.n_head_kv == 0 || cfg.n_head % cfg.n_head_kv != 0 {
             bail!(
-                "grouped-query attention not yet supported (head_count_kv={} != head_count={})",
-                cfg.n_head_kv,
-                cfg.n_head
+                "head_count {} must be a positive multiple of head_count_kv {}",
+                cfg.n_head,
+                cfg.n_head_kv
             );
         }
         let tokenizer = Tokenizer::from_gguf(&gguf)?;
@@ -50,7 +50,10 @@ impl Model {
 
         let c = cfg.n_embd;
         let nh = cfg.n_head;
+        let nkv = cfg.n_head_kv;
         let hd = cfg.head_dim();
+        let kv_dim = cfg.kv_dim();
+        let group = nh / nkv; // query heads sharing each kv head
         let eps = cfg.rms_eps;
         let scale = 1.0 / (hd as f32).sqrt();
 
@@ -64,34 +67,36 @@ impl Model {
             rmsnorm(&x, lw.attn_norm, eps, &mut normed);
 
             let mut q = vec![0.0f32; c];
-            let mut k = vec![0.0f32; c];
-            let mut v = vec![0.0f32; c];
+            let mut k = vec![0.0f32; kv_dim];
+            let mut v = vec![0.0f32; kv_dim];
             lw.attn_q.matvec(&normed, &mut q);
             lw.attn_k.matvec(&normed, &mut k);
             lw.attn_v.matvec(&normed, &mut v);
 
             rope(&mut q, pos, nh, hd, cfg.rope_freq_base);
-            rope(&mut k, pos, nh, hd, cfg.rope_freq_base);
+            rope(&mut k, pos, nkv, hd, cfg.rope_freq_base);
 
             kv.append(l, &k, &v);
             let keys = kv.keys(l);
             let vals = kv.values(l);
             let seq = kv.len(); // = pos + 1
 
-            // Per-head causal attention over the cache.
+            // Per-head causal attention over the cache; query head `h` reads the
+            // kv head it shares, `h / group` (GQA). group == 1 is plain MHA.
             let mut atty = vec![0.0f32; c];
             let mut scores = vec![0.0f32; seq];
             for h in 0..nh {
+                let kvh = h / group;
                 let qh = &q[h * hd..h * hd + hd];
                 for (t, score) in scores.iter_mut().enumerate() {
-                    let kh = &keys[t * c + h * hd..t * c + h * hd + hd];
+                    let kh = &keys[t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd];
                     let dot: f32 = qh.iter().zip(kh).map(|(a, b)| a * b).sum();
                     *score = dot * scale;
                 }
                 softmax(&mut scores);
                 let oh = &mut atty[h * hd..h * hd + hd];
                 for (t, &a) in scores.iter().enumerate() {
-                    let vh = &vals[t * c + h * hd..t * c + h * hd + hd];
+                    let vh = &vals[t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd];
                     for (o, &vi) in oh.iter_mut().zip(vh) {
                         *o += a * vi;
                     }
