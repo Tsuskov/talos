@@ -7,9 +7,17 @@ Llama-style forward pass with a KV cache, and samples tokens — a tiny
 It's the runtime half of a from-scratch loop: **train → forge GGUF → run**.
 The companion project trains the model and exports the GGUF; Talos runs it.
 
+![Talos heaving a boulder at the Argo, as block-ASCII art](assets/talos.png)
+
+> In myth, Talos was the bronze automaton forged by **Hephaistos** to guard
+> Crete — the machine that runs what the smith made. Above: Asmus Jacob
+> Carstens' engraving of Talos (public domain), rendered to colored block-ASCII
+> with [ren-ascii-sance](https://github.com/Tsuskov/ren-ascii-sance).
+
 ## Status
 
-M0–M2 implemented: GGUF reader, byte-BPE tokenizer, math kernels, and the
+M0–M5 implemented, plus grouped-query attention: GGUF reader, byte-BPE
+tokenizer, math kernels, and the
 Llama forward pass with a KV cache, verified against the trainer's logits.
 
 | Milestone | What | Verify |
