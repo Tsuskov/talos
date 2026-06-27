@@ -45,8 +45,10 @@ encoder, so Metal orders them with memory coherence — no inter-kernel races, n
 manual barriers. The CPU `forward` stays the reference; `forward_gpu` matches it
 to ~1e-7 over a multi-token GQA sequence and is bit-identical across runs
 (`tests/forward_gpu.rs`, built only with `--features metal`). End-to-end decode
-tok/s (GPU vs CPU) needs a real Hephaistos model — `cargo bench --features metal`
-benches `f32`/`q4` and their `_gpu` variants when `models/*.gguf` are present.
+on the bench models (`cargo bench --features metal -- decode`, 64 tokens) the GPU
+forward beats the rayon CPU path **2.8×** on F32 (664 → 1843 tok/s) and **3.7×**
+on Q4_0 (617 → 2302 tok/s) — the single command buffer per token amortizes the
+per-dispatch overhead that held M8.1 back.
 
 | Milestone | What | Verify |
 |-----------|------|--------|
@@ -60,7 +62,7 @@ benches `f32`/`q4` and their `_gpu` variants when `models/*.gguf` are present.
 | M7 | Metal GPU matvec (F32 + fused Q8_0/Q4_0), opt-in `--features metal` | GPU logits match the CPU kernels (`cargo test --features metal`) |
 | M8.0 | Resident weights (upload once, keyed by name) | cached buffer is reused, not re-uploaded (`resident_weight_is_cached`); 6.3× over per-call upload |
 | M8.1 | Coalesced simdgroup matvec (one simdgroup/row, `simd_sum`) | GPU logits still match CPU; 0.79 ms/matvec (1.4× over M8.0) |
-| M8.2 | Whole forward on GPU (`forward_gpu`): resident KV cache, one serial command buffer/token | GPU forward matches CPU to ~1e-7 + deterministic (`tests/forward_gpu.rs`) |
+| M8.2 | Whole forward on GPU (`forward_gpu`): resident KV cache, one serial command buffer/token | GPU forward matches CPU to ~1e-7 + deterministic (`tests/forward_gpu.rs`); 2.8× (f32) / 3.7× (q4) decode vs CPU |
 
 ## Usage
 
