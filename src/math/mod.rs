@@ -6,5 +6,7 @@
 //! hot path.
 
 pub mod matmul;
+#[cfg(feature = "metal")]
+pub mod metal;
 pub mod ops;
 pub mod quant;

@@ -40,6 +40,19 @@ fn bench_decode(c: &mut Criterion) {
                 black_box(tok)
             });
         });
+        // M8.2: the whole forward pass on the GPU, one command buffer per token.
+        #[cfg(feature = "metal")]
+        group.bench_function(format!("{name}_gpu"), |b| {
+            b.iter(|| {
+                model.reset();
+                let mut tok = 1u32;
+                for pos in 0..DECODE_LEN as usize {
+                    let logits = model.forward_gpu(tok, pos);
+                    tok = argmax(black_box(&logits)) % vocab;
+                }
+                black_box(tok)
+            });
+        });
     }
     group.finish();
 }
@@ -70,6 +83,26 @@ fn bench_matvec(c: &mut Criterion) {
             }
         });
     });
+    // The actual production CPU path (rayon-parallel over rows) — the honest
+    // baseline for the GPU numbers below. `scalar`/`simd` above isolate the
+    // single-row kernel.
+    group.bench_function("cpu_parallel", |b| {
+        b.iter(|| talos::math::matmul::matvec(black_box(&w), black_box(&x), &mut out, rows, cols));
+    });
+    // M7 vs M8.0: uploading the weight every call (the per-token cost) vs keeping
+    // it resident on the GPU.
+    #[cfg(feature = "metal")]
+    {
+        use talos::math::metal;
+        group.bench_function("gpu_upload", |b| {
+            b.iter(|| metal::matvec_f32(black_box(&w), black_box(&x), &mut out, rows, cols));
+        });
+        group.bench_function("gpu_resident", |b| {
+            b.iter(|| {
+                metal::matvec_f32_resident("bench.w", black_box(&w), black_box(&x), &mut out, rows, cols)
+            });
+        });
+    }
     group.finish();
 }
 

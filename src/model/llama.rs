@@ -21,6 +21,9 @@ pub struct Model {
     pub tokenizer: Tokenizer,
     gguf: GgufFile,
     kv: KvCache,
+    /// Persistent GPU-resident KV cache for the Metal forward (M8.2).
+    #[cfg(feature = "metal")]
+    gpu_kv: crate::math::metal::GpuKv,
 }
 
 impl Model {
@@ -37,7 +40,14 @@ impl Model {
         }
         let tokenizer = Tokenizer::from_gguf(&gguf)?;
         let kv = KvCache::new(cfg.n_layer, cfg.n_head_kv, cfg.head_dim(), cfg.context_length);
-        Ok(Self { cfg, tokenizer, gguf, kv })
+        Ok(Self {
+            cfg,
+            tokenizer,
+            gguf,
+            kv,
+            #[cfg(feature = "metal")]
+            gpu_kv: crate::math::metal::GpuKv::new(),
+        })
     }
 
     /// Run one decode step for `token` at sequence position `pos`, returning
@@ -131,6 +141,18 @@ impl Model {
         let mut logits = vec![0.0f32; cfg.vocab_size];
         w.output.matvec(&xf, &mut logits);
         logits
+    }
+
+    /// Run one decode step entirely on the GPU (M8.2): the whole forward pass in
+    /// a single command buffer, with the residual stream and KV cache resident on
+    /// the GPU; only the logits are read back. Matches [`Model::forward`].
+    #[cfg(feature = "metal")]
+    pub fn forward_gpu(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let w = Weights::from_gguf(&self.gguf, cfg).expect("weights bind");
+        let mut x = vec![0.0f32; cfg.n_embd];
+        w.token_embd.dequant_row(token as usize, &mut x);
+        crate::math::metal::forward(cfg, &w, &x, pos, &mut self.gpu_kv)
     }
 
     /// Reset the KV cache to start a fresh sequence.

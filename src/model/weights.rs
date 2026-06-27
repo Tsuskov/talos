@@ -22,15 +22,28 @@ pub struct QTensor<'a> {
     dtype: GgmlType,
     rows: usize,
     cols: usize,
+    /// Tensor name, the key for the resident GPU weight buffer (M8.0). Only the
+    /// Metal path needs it, so the CPU build stays allocation-free.
+    #[cfg(feature = "metal")]
+    name: String,
 }
 
 impl<'a> QTensor<'a> {
     fn bind(g: &'a GgufFile, name: &str, rows: usize, cols: usize) -> Result<Self> {
         let (bytes, dtype) = g.tensor_raw(name)?;
-        Ok(QTensor { bytes, dtype, rows, cols })
+        Ok(QTensor {
+            bytes,
+            dtype,
+            rows,
+            cols,
+            #[cfg(feature = "metal")]
+            name: name.to_string(),
+        })
     }
 
-    /// `out[m] = <row m, x>`, dequantizing on the fly for quantized dtypes.
+    /// `out[m] = <row m, x>` on the CPU, dequantizing quantized dtypes on the
+    /// fly. This is the reference path; the Metal GPU forward (M8.2) reads the
+    /// raw parts via [`QTensor::gpu_parts`] instead.
     pub fn matvec(&self, x: &[f32], out: &mut [f32]) {
         match self.dtype {
             GgmlType::F32 => {
@@ -46,6 +59,13 @@ impl<'a> QTensor<'a> {
         let row_bytes = (self.cols / self.dtype.block_elems()) * self.dtype.block_bytes();
         self.dtype
             .dequantize(&self.bytes[r * row_bytes..(r + 1) * row_bytes], out);
+    }
+
+    /// Raw parts for the Metal GPU forward: `(bytes, dtype, rows, cols, name)`.
+    /// `name` keys the resident GPU weight buffer.
+    #[cfg(feature = "metal")]
+    pub(crate) fn gpu_parts(&self) -> (&[u8], GgmlType, usize, usize, &str) {
+        (self.bytes, self.dtype, self.rows, self.cols, &self.name)
     }
 }
 
