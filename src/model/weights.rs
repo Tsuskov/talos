@@ -12,6 +12,9 @@
 use anyhow::Result;
 
 use crate::gguf::{GgmlType, GgufFile};
+#[cfg(feature = "metal")]
+use crate::math::metal;
+#[cfg(not(feature = "metal"))]
 use crate::math::{matmul, quant};
 use crate::model::Config;
 
@@ -31,7 +34,18 @@ impl<'a> QTensor<'a> {
     }
 
     /// `out[m] = <row m, x>`, dequantizing on the fly for quantized dtypes.
+    ///
+    /// With `--features metal` the dot products run on the GPU (M7); otherwise
+    /// the SIMD CPU path. Both produce the same logits within tolerance.
     pub fn matvec(&self, x: &[f32], out: &mut [f32]) {
+        #[cfg(feature = "metal")]
+        match self.dtype {
+            GgmlType::F32 => {
+                metal::matvec_f32(bytemuck::cast_slice(self.bytes), x, out, self.rows, self.cols)
+            }
+            _ => metal::matvec_quant(self.bytes, self.dtype, x, out, self.rows, self.cols),
+        }
+        #[cfg(not(feature = "metal"))]
         match self.dtype {
             GgmlType::F32 => {
                 let w: &[f32] = bytemuck::cast_slice(self.bytes);

@@ -20,6 +20,12 @@ rayon = "1"
 rand = "0.8"
 half = "2"
 wide = "0.7"
+metal = { version = "0.29", optional = true }
+
+[features]
+# M7: run the matvec hot path on the Apple GPU. Off by default so CPU builds
+# (and CI without a GPU) are untouched.
+metal = ["dep:metal"]
 
 [dev-dependencies]
 criterion = "0.5"

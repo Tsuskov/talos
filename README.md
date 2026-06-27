@@ -21,6 +21,14 @@ tokenizer, math kernels, the Llama forward pass with a KV cache, sampling,
 quantized inference, and a perplexity harness — all verified against the
 trainer's logits. `cargo test` is green; `cargo bench` reports throughput.
 
+M7 (opt-in, `--features metal`) moves the matvec hot path — F32 and fused
+dequant for Q8_0/Q4_0 — onto the Apple GPU, one thread per output row, verified
+against the CPU kernels (`cargo test --features metal`). It is a **correctness**
+milestone, not yet a speed one: rmsnorm/rope/attention stay on the CPU and
+weights re-upload each call, so the per-layer round-trips mean it is not faster
+than the SIMD CPU path. Keeping weights resident and porting the rest of the
+forward pass — the actual throughput win — is M8.
+
 | Milestone | What | Verify |
 |-----------|------|--------|
 | M0 | GGUF reader (mmap, metadata, tensor index) | `talos inspect model.gguf` lists every tensor + hyperparam |
@@ -30,6 +38,7 @@ trainer's logits. `cargo test` is green; `cargo bench` reports throughput.
 | M4 | Quantization (Q8_0, Q4_0) | quantized logits & perplexity stay within budget of F32 (`tests/quant.rs`) |
 | M5 | SIMD matmul + fused dequant | tok/s vs llama.cpp (`benches/tokps.rs`) |
 | M6 | Perplexity harness (`talos perplexity`) | uniform logits score `ln(vocab)`; quant perplexity tracks F32 |
+| M7 | Metal GPU matvec (F32 + fused Q8_0/Q4_0), opt-in `--features metal` | GPU logits match the CPU kernels (`cargo test --features metal`) |
 
 ## Usage
 
@@ -39,12 +48,16 @@ talos run models/tiny.gguf --prompt "Once upon a time" -n 128 --temp 0.8
 talos perplexity models/tiny.gguf corpus.txt   # the honest quality number
 ```
 
+Build with `cargo build --release --features metal` to run matvec on the GPU
+(Apple Silicon). The default build is CPU-only.
+
 ## Layout
 
 ```
 src/gguf/      GGUF v3 reader (header, metadata, tensor index)
 src/tokenizer  byte-level BPE
 src/math/      rmsnorm, rope, softmax, swiglu, matvec
+src/math/metal Metal GPU matvec kernels (opt-in, M7)
 src/model/     config, weight handles, Llama forward pass
 src/kv_cache   per-layer key/value cache
 src/sample     logit sampling
