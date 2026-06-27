@@ -10,7 +10,9 @@
 //!   model     — lead (M2), depends on the three above
 //!   kv_cache  — lead (M2)
 //!   sample    — lead (M3)
+//!   eval      — lead (M6), perplexity
 
+pub mod eval;
 pub mod gguf;
 pub mod kv_cache;
 pub mod math;

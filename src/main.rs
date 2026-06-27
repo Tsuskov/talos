@@ -2,6 +2,7 @@
 //!
 //!   talos inspect <model.gguf>
 //!   talos run <model.gguf> --prompt "…" [-n N] [--temp T] [--top-k K] [--top-p P] [--seed S]
+//!   talos perplexity <model.gguf> <text-file>
 
 use std::io::Write;
 use std::path::Path;
@@ -22,6 +23,7 @@ fn main() -> Result<()> {
             inspect(path)
         }
         Some("run") => run(&args[1..]),
+        Some("perplexity") => perplexity(&args[1..]),
         _ => Err(usage_err()),
     }
 }
@@ -33,6 +35,29 @@ fn inspect(path: &Path) -> Result<()> {
     for t in g.tensors() {
         println!("  {:<32} {:?} {:?}", t.name, t.dims, t.dtype);
     }
+    Ok(())
+}
+
+/// `talos perplexity <model.gguf> <text-file>` — teacher-forced perplexity of
+/// the file's text under the model. The honest quality number: run it on the
+/// same text for the F32 and quantized exports to see what quantization costs.
+fn perplexity(args: &[String]) -> Result<()> {
+    let model_path = args.first().ok_or_else(usage_err)?;
+    let text_path = args.get(1).ok_or_else(usage_err)?;
+
+    let mut model = Model::load(Path::new(model_path))?;
+    let text = std::fs::read_to_string(text_path)
+        .with_context(|| format!("reading {text_path}"))?;
+
+    // Prepend BOS so the first real token is scored with context.
+    let mut tokens = vec![model.tokenizer.bos()];
+    tokens.extend(model.tokenizer.encode(&text));
+    if tokens.len() < 2 {
+        bail!("text encoded to fewer than 2 tokens; nothing to score");
+    }
+
+    let ppl = talos::eval::perplexity(&mut model, &tokens);
+    println!("perplexity {ppl:.4}  ({} tokens)", tokens.len());
     Ok(())
 }
 
@@ -132,6 +157,6 @@ impl Opts {
 
 fn usage_err() -> anyhow::Error {
     anyhow::anyhow!(
-        "usage:\n  talos inspect <model.gguf>\n  talos run <model.gguf> --prompt \"…\" [-n N] [--temp T] [--top-k K] [--top-p P] [--seed S]"
+        "usage:\n  talos inspect <model.gguf>\n  talos run <model.gguf> --prompt \"…\" [-n N] [--temp T] [--top-k K] [--top-p P] [--seed S]\n  talos perplexity <model.gguf> <text-file>"
     )
 }
