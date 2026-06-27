@@ -40,6 +40,19 @@ fn bench_decode(c: &mut Criterion) {
                 black_box(tok)
             });
         });
+        // M8.2: the whole forward pass on the GPU, one command buffer per token.
+        #[cfg(feature = "metal")]
+        group.bench_function(format!("{name}_gpu"), |b| {
+            b.iter(|| {
+                model.reset();
+                let mut tok = 1u32;
+                for pos in 0..DECODE_LEN as usize {
+                    let logits = model.forward_gpu(tok, pos);
+                    tok = argmax(black_box(&logits)) % vocab;
+                }
+                black_box(tok)
+            });
+        });
     }
     group.finish();
 }

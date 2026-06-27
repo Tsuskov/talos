@@ -21,9 +21,9 @@ tokenizer, math kernels, the Llama forward pass with a KV cache, sampling,
 quantized inference, and a perplexity harness — all verified against the
 trainer's logits. `cargo test` is green; `cargo bench` reports throughput.
 
-M7 (opt-in, `--features metal`) moves the matvec hot path — F32 and fused
-dequant for Q8_0/Q4_0 — onto the Apple GPU, one thread per output row, verified
-against the CPU kernels (`cargo test --features metal`).
+M7 (opt-in, `--features metal`) is the matvec building block — F32 and fused
+dequant for Q8_0/Q4_0 on the Apple GPU, verified against the CPU kernels
+(`cargo test --features metal`).
 
 M8.0 keeps each weight tensor resident on the GPU (uploaded once at first use,
 keyed by name) instead of re-uploading it every call: **6.3×** over M7's per-call
@@ -37,6 +37,17 @@ per-matvec command-buffer overhead (commit/wait on every call); closing it needs
 one command buffer for the whole token (the rest of the forward pass on the GPU)
 — M8.2.
 
+M8.2 puts the **whole forward pass** on the GPU: `Model::forward_gpu` keeps the
+residual stream and KV cache resident and encodes every op (rmsnorm, q/k/v
+matvec, RoPE, attention, SwiGLU, output projection) into a single command buffer
+per token, reading back only the logits. The kernels run in one *serial* compute
+encoder, so Metal orders them with memory coherence — no inter-kernel races, no
+manual barriers. The CPU `forward` stays the reference; `forward_gpu` matches it
+to ~1e-7 over a multi-token GQA sequence and is bit-identical across runs
+(`tests/forward_gpu.rs`, built only with `--features metal`). End-to-end decode
+tok/s (GPU vs CPU) needs a real Hephaistos model — `cargo bench --features metal`
+benches `f32`/`q4` and their `_gpu` variants when `models/*.gguf` are present.
+
 | Milestone | What | Verify |
 |-----------|------|--------|
 | M0 | GGUF reader (mmap, metadata, tensor index) | `talos inspect model.gguf` lists every tensor + hyperparam |
@@ -49,6 +60,7 @@ one command buffer for the whole token (the rest of the forward pass on the GPU)
 | M7 | Metal GPU matvec (F32 + fused Q8_0/Q4_0), opt-in `--features metal` | GPU logits match the CPU kernels (`cargo test --features metal`) |
 | M8.0 | Resident weights (upload once, keyed by name) | cached buffer is reused, not re-uploaded (`resident_weight_is_cached`); 6.3× over per-call upload |
 | M8.1 | Coalesced simdgroup matvec (one simdgroup/row, `simd_sum`) | GPU logits still match CPU; 0.79 ms/matvec (1.4× over M8.0) |
+| M8.2 | Whole forward on GPU (`forward_gpu`): resident KV cache, one serial command buffer/token | GPU forward matches CPU to ~1e-7 + deterministic (`tests/forward_gpu.rs`) |
 
 ## Usage
 
@@ -73,6 +85,7 @@ src/kv_cache   per-layer key/value cache
 src/sample     logit sampling
 src/eval       teacher-forced perplexity
 tests/parity   the numerical contract
+tests/forward_gpu  GPU-forward == CPU-forward (M8.2, --features metal)
 benches/tokps  throughput
 ```
 

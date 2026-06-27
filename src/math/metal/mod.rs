@@ -251,6 +251,243 @@ pub fn matvec_quant_resident(
     });
 }
 
+// ===== M8.2: the whole forward pass on the GPU =====
+//
+// One command buffer per token, encoded into a single *serial* compute encoder:
+// serial dispatch makes Metal run the kernels in order with memory coherence
+// between them, so there are no inter-kernel races and no manual barriers. The
+// residual stream and KV cache stay in GPU buffers across all layers; only the
+// final logits are read back. Mirrors `model::llama::Model::forward` exactly and
+// is checked against it (`forward_matches_cpu`).
+
+use crate::gguf::GgmlType;
+use crate::model::weights::QTensor;
+use crate::model::{Config, Weights};
+use metal::{Buffer, ComputeCommandEncoderRef};
+
+/// Per-layer key/value cache living in GPU memory, allocated lazily on the first
+/// `forward` and reused across tokens.
+#[derive(Default)]
+pub struct GpuKv {
+    keys: Vec<Buffer>,
+    values: Vec<Buffer>,
+}
+
+impl GpuKv {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+fn set_u32(enc: &ComputeCommandEncoderRef, idx: u64, v: u32) {
+    enc.set_bytes(idx, 4, &v as *const u32 as *const c_void);
+}
+fn set_f32(enc: &ComputeCommandEncoderRef, idx: u64, v: f32) {
+    enc.set_bytes(idx, 4, &v as *const f32 as *const c_void);
+}
+
+/// Encode one threadgroup per output row (one simdgroup wide), matvec into `out`.
+fn enc_matvec(ctx: &MetalCtx, enc: &ComputeCommandEncoderRef, wt: &QTensor, xin: &Buffer, out: &Buffer) {
+    let (bytes, dtype, rows, cols, name) = wt.gpu_parts();
+    let kernel = if dtype == GgmlType::F32 { "matvec_f32" } else { quant_kernel(dtype) };
+    let wbuf = ctx.resident_weight(name, bytes);
+    let pipe = ctx.pipeline(kernel);
+    let width = pipe.thread_execution_width();
+    enc.set_compute_pipeline_state(&pipe);
+    enc.set_buffer(0, Some(&wbuf), 0);
+    enc.set_buffer(1, Some(xin), 0);
+    enc.set_buffer(2, Some(out), 0);
+    set_u32(enc, 3, cols as u32);
+    enc.dispatch_thread_groups(
+        MTLSize { width: rows as u64, height: 1, depth: 1 },
+        MTLSize { width, height: 1, depth: 1 },
+    );
+}
+
+/// RMSNorm: one simdgroup-wide threadgroup reduces, then writes `out`.
+fn enc_rmsnorm(ctx: &MetalCtx, enc: &ComputeCommandEncoderRef, x: &Buffer, weight: &Buffer, out: &Buffer, n: usize, eps: f32) {
+    let pipe = ctx.pipeline("rmsnorm");
+    let width = pipe.thread_execution_width();
+    enc.set_compute_pipeline_state(&pipe);
+    enc.set_buffer(0, Some(x), 0);
+    enc.set_buffer(1, Some(weight), 0);
+    enc.set_buffer(2, Some(out), 0);
+    set_u32(enc, 3, n as u32);
+    set_f32(enc, 4, eps);
+    enc.dispatch_thread_groups(
+        MTLSize { width: 1, height: 1, depth: 1 },
+        MTLSize { width, height: 1, depth: 1 },
+    );
+}
+
+/// Per-head softmax over `seq` scores: one simdgroup per head.
+fn enc_softmax(ctx: &MetalCtx, enc: &ComputeCommandEncoderRef, scores: &Buffer, nh: usize, seq: usize) {
+    let pipe = ctx.pipeline("attn_softmax");
+    let width = pipe.thread_execution_width();
+    enc.set_compute_pipeline_state(&pipe);
+    enc.set_buffer(0, Some(scores), 0);
+    set_u32(enc, 1, seq as u32);
+    enc.dispatch_thread_groups(
+        MTLSize { width: nh as u64, height: 1, depth: 1 },
+        MTLSize { width, height: 1, depth: 1 },
+    );
+}
+
+/// One thread per element (`n` threads), caller sets the buffers in `setup`.
+fn enc_1d(ctx: &MetalCtx, enc: &ComputeCommandEncoderRef, kernel: &'static str, n: usize, setup: impl FnOnce(&ComputeCommandEncoderRef)) {
+    let pipe = ctx.pipeline(kernel);
+    enc.set_compute_pipeline_state(&pipe);
+    setup(enc);
+    let tg = pipe.max_total_threads_per_threadgroup().min(n as u64).max(1);
+    enc.dispatch_threads(
+        MTLSize { width: n as u64, height: 1, depth: 1 },
+        MTLSize { width: tg, height: 1, depth: 1 },
+    );
+}
+
+/// Run the full forward pass for one token on the GPU, returning the logits.
+/// `x_embed` is the token's embedding row (dequantized on the CPU by the caller).
+pub fn forward(cfg: &Config, w: &Weights, x_embed: &[f32], pos: usize, kv: &mut GpuKv) -> Vec<f32> {
+    let c = cfg.n_embd;
+    let nh = cfg.n_head;
+    let nkv = cfg.n_head_kv;
+    let hd = cfg.head_dim();
+    let kv_dim = cfg.kv_dim();
+    let group = nh / nkv;
+    let ff = cfg.n_ff;
+    let vocab = cfg.vocab_size;
+    let ctx_len = cfg.context_length;
+    let eps = cfg.rms_eps;
+    let freq = cfg.rope_freq_base;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let seq = pos + 1;
+
+    CTX.with(|ctx| {
+        if kv.keys.is_empty() {
+            for _ in 0..cfg.n_layer {
+                kv.keys.push(ctx.out_buffer(ctx_len * kv_dim));
+                kv.values.push(ctx.out_buffer(ctx_len * kv_dim));
+            }
+        }
+
+        // Residual stream + scratch, reused across layers.
+        let xb = ctx.buffer_from(bytemuck::cast_slice(x_embed));
+        let normed = ctx.out_buffer(c);
+        let q = ctx.out_buffer(c);
+        let kbuf = ctx.out_buffer(kv_dim);
+        let vbuf = ctx.out_buffer(kv_dim);
+        let scores = ctx.out_buffer(nh * ctx_len);
+        let atty = ctx.out_buffer(c);
+        let attproj = ctx.out_buffer(c);
+        let gate = ctx.out_buffer(ff);
+        let up = ctx.out_buffer(ff);
+        let glu = ctx.out_buffer(ff);
+        let down = ctx.out_buffer(c);
+        let xf = ctx.out_buffer(c);
+        let logits = ctx.out_buffer(vocab);
+
+        let cmd = ctx.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+
+        for (l, lw) in w.layers.iter().enumerate() {
+            // --- attention ---
+            let attn_norm = ctx.resident_weight(
+                &format!("blk.{l}.attn_norm.weight"),
+                bytemuck::cast_slice(lw.attn_norm),
+            );
+            enc_rmsnorm(ctx, enc, &xb, &attn_norm, &normed, c, eps);
+            enc_matvec(ctx, enc, &lw.attn_q, &normed, &q);
+            enc_matvec(ctx, enc, &lw.attn_k, &normed, &kbuf);
+            enc_matvec(ctx, enc, &lw.attn_v, &normed, &vbuf);
+
+            enc_1d(ctx, enc, "rope", nh * (hd / 2), |e| {
+                e.set_buffer(0, Some(&q), 0);
+                set_u32(e, 1, nh as u32);
+                set_u32(e, 2, hd as u32);
+                set_u32(e, 3, pos as u32);
+                set_f32(e, 4, freq);
+            });
+            enc_1d(ctx, enc, "rope", nkv * (hd / 2), |e| {
+                e.set_buffer(0, Some(&kbuf), 0);
+                set_u32(e, 1, nkv as u32);
+                set_u32(e, 2, hd as u32);
+                set_u32(e, 3, pos as u32);
+                set_f32(e, 4, freq);
+            });
+
+            // append k,v into the cache at this position
+            let off = (pos * kv_dim) as u32;
+            enc_1d(ctx, enc, "copy_to", kv_dim, |e| {
+                e.set_buffer(0, Some(&kbuf), 0);
+                e.set_buffer(1, Some(&kv.keys[l]), 0);
+                set_u32(e, 2, off);
+            });
+            enc_1d(ctx, enc, "copy_to", kv_dim, |e| {
+                e.set_buffer(0, Some(&vbuf), 0);
+                e.set_buffer(1, Some(&kv.values[l]), 0);
+                set_u32(e, 2, off);
+            });
+
+            enc_1d(ctx, enc, "attn_scores", nh * seq, |e| {
+                e.set_buffer(0, Some(&q), 0);
+                e.set_buffer(1, Some(&kv.keys[l]), 0);
+                e.set_buffer(2, Some(&scores), 0);
+                set_u32(e, 3, hd as u32);
+                set_u32(e, 4, kv_dim as u32);
+                set_u32(e, 5, group as u32);
+                set_u32(e, 6, seq as u32);
+                set_f32(e, 7, scale);
+            });
+            enc_softmax(ctx, enc, &scores, nh, seq);
+            enc_1d(ctx, enc, "attn_output", nh * hd, |e| {
+                e.set_buffer(0, Some(&scores), 0);
+                e.set_buffer(1, Some(&kv.values[l]), 0);
+                e.set_buffer(2, Some(&atty), 0);
+                set_u32(e, 3, hd as u32);
+                set_u32(e, 4, kv_dim as u32);
+                set_u32(e, 5, group as u32);
+                set_u32(e, 6, seq as u32);
+            });
+
+            enc_matvec(ctx, enc, &lw.attn_output, &atty, &attproj);
+            enc_1d(ctx, enc, "add_inplace", c, |e| {
+                e.set_buffer(0, Some(&xb), 0);
+                e.set_buffer(1, Some(&attproj), 0);
+            });
+
+            // --- feed-forward (SwiGLU) ---
+            let ffn_norm = ctx.resident_weight(
+                &format!("blk.{l}.ffn_norm.weight"),
+                bytemuck::cast_slice(lw.ffn_norm),
+            );
+            enc_rmsnorm(ctx, enc, &xb, &ffn_norm, &normed, c, eps);
+            enc_matvec(ctx, enc, &lw.ffn_gate, &normed, &gate);
+            enc_matvec(ctx, enc, &lw.ffn_up, &normed, &up);
+            enc_1d(ctx, enc, "swiglu", ff, |e| {
+                e.set_buffer(0, Some(&gate), 0);
+                e.set_buffer(1, Some(&up), 0);
+                e.set_buffer(2, Some(&glu), 0);
+            });
+            enc_matvec(ctx, enc, &lw.ffn_down, &glu, &down);
+            enc_1d(ctx, enc, "add_inplace", c, |e| {
+                e.set_buffer(0, Some(&xb), 0);
+                e.set_buffer(1, Some(&down), 0);
+            });
+        }
+
+        // final norm + output projection
+        let output_norm =
+            ctx.resident_weight("output_norm.weight", bytemuck::cast_slice(w.output_norm));
+        enc_rmsnorm(ctx, enc, &xb, &output_norm, &xf, c, eps);
+        enc_matvec(ctx, enc, &w.output, &xf, &logits);
+
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        read_f32(&logits, vocab).to_vec()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,9 +12,6 @@
 use anyhow::Result;
 
 use crate::gguf::{GgmlType, GgufFile};
-#[cfg(feature = "metal")]
-use crate::math::metal;
-#[cfg(not(feature = "metal"))]
 use crate::math::{matmul, quant};
 use crate::model::Config;
 
@@ -44,32 +41,10 @@ impl<'a> QTensor<'a> {
         })
     }
 
-    /// `out[m] = <row m, x>`, dequantizing on the fly for quantized dtypes.
-    ///
-    /// With `--features metal` the dot products run on the GPU (M7); otherwise
-    /// the SIMD CPU path. Both produce the same logits within tolerance.
+    /// `out[m] = <row m, x>` on the CPU, dequantizing quantized dtypes on the
+    /// fly. This is the reference path; the Metal GPU forward (M8.2) reads the
+    /// raw parts via [`QTensor::gpu_parts`] instead.
     pub fn matvec(&self, x: &[f32], out: &mut [f32]) {
-        #[cfg(feature = "metal")]
-        match self.dtype {
-            GgmlType::F32 => metal::matvec_f32_resident(
-                &self.name,
-                bytemuck::cast_slice(self.bytes),
-                x,
-                out,
-                self.rows,
-                self.cols,
-            ),
-            _ => metal::matvec_quant_resident(
-                &self.name,
-                self.bytes,
-                self.dtype,
-                x,
-                out,
-                self.rows,
-                self.cols,
-            ),
-        }
-        #[cfg(not(feature = "metal"))]
         match self.dtype {
             GgmlType::F32 => {
                 let w: &[f32] = bytemuck::cast_slice(self.bytes);
@@ -84,6 +59,13 @@ impl<'a> QTensor<'a> {
         let row_bytes = (self.cols / self.dtype.block_elems()) * self.dtype.block_bytes();
         self.dtype
             .dequantize(&self.bytes[r * row_bytes..(r + 1) * row_bytes], out);
+    }
+
+    /// Raw parts for the Metal GPU forward: `(bytes, dtype, rows, cols, name)`.
+    /// `name` keys the resident GPU weight buffer.
+    #[cfg(feature = "metal")]
+    pub(crate) fn gpu_parts(&self) -> (&[u8], GgmlType, usize, usize, &str) {
+        (self.bytes, self.dtype, self.rows, self.cols, &self.name)
     }
 }
 
