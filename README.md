@@ -26,13 +26,16 @@ dequant for Q8_0/Q4_0 — onto the Apple GPU, one thread per output row, verifie
 against the CPU kernels (`cargo test --features metal`).
 
 M8.0 keeps each weight tensor resident on the GPU (uploaded once at first use,
-keyed by name) instead of re-uploading it every call. On a 4096×4096 matvec that
-is a **6.3×** speedup over M7's per-call upload (6.98 ms → 1.10 ms;
-`cargo bench --features metal -- matvec_4096`). Honest caveat: it is still ~2×
-slower than the rayon CPU path (0.50 ms), because each matvec is its own command
-buffer (commit/wait overhead) and the kernel is naive (adjacent threads read
-`cols` apart — poor coalescing). Beating the CPU needs one command buffer per
-token (whole forward on GPU) and a coalesced/simdgroup-reduction kernel — M8.1+.
+keyed by name) instead of re-uploading it every call: **6.3×** over M7's per-call
+upload on a 4096×4096 matvec (6.98 ms → 1.10 ms).
+
+M8.1 makes the kernel one simdgroup per output row — lanes stride the row so
+reads coalesce, then `simd_sum` reduces — taking the resident matvec to **0.79
+ms** (1.4× over M8.0; `cargo bench --features metal -- matvec_4096`). Honest
+caveat: that is still ~1.6× the rayon CPU path (0.50 ms). The remaining gap is
+per-matvec command-buffer overhead (commit/wait on every call); closing it needs
+one command buffer for the whole token (the rest of the forward pass on the GPU)
+— M8.2.
 
 | Milestone | What | Verify |
 |-----------|------|--------|
@@ -45,6 +48,7 @@ token (whole forward on GPU) and a coalesced/simdgroup-reduction kernel — M8.1
 | M6 | Perplexity harness (`talos perplexity`) | uniform logits score `ln(vocab)`; quant perplexity tracks F32 |
 | M7 | Metal GPU matvec (F32 + fused Q8_0/Q4_0), opt-in `--features metal` | GPU logits match the CPU kernels (`cargo test --features metal`) |
 | M8.0 | Resident weights (upload once, keyed by name) | cached buffer is reused, not re-uploaded (`resident_weight_is_cached`); 6.3× over per-call upload |
+| M8.1 | Coalesced simdgroup matvec (one simdgroup/row, `simd_sum`) | GPU logits still match CPU; 0.79 ms/matvec (1.4× over M8.0) |
 
 ## Usage
 

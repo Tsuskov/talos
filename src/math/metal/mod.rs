@@ -158,12 +158,23 @@ fn run_matvec(
     let xbuf = ctx.buffer_from(bytemuck::cast_slice(x));
     let obuf = ctx.out_buffer(rows);
     let cols_u32 = cols as u32;
-    dispatch_1d(ctx, &pipe, rows, |enc| {
-        enc.set_buffer(0, Some(wbuf), 0);
-        enc.set_buffer(1, Some(&xbuf), 0);
-        enc.set_buffer(2, Some(&obuf), 0);
-        enc.set_bytes(3, 4, &cols_u32 as *const u32 as *const c_void);
-    });
+    // One threadgroup per output row, sized to exactly one simdgroup so the
+    // kernel's `simd_sum` reduces the whole group (M8.1).
+    let width = pipe.thread_execution_width();
+    let cmd = ctx.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipe);
+    enc.set_buffer(0, Some(wbuf), 0);
+    enc.set_buffer(1, Some(&xbuf), 0);
+    enc.set_buffer(2, Some(&obuf), 0);
+    enc.set_bytes(3, 4, &cols_u32 as *const u32 as *const c_void);
+    enc.dispatch_thread_groups(
+        MTLSize { width: rows as u64, height: 1, depth: 1 },
+        MTLSize { width, height: 1, depth: 1 },
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
     out.copy_from_slice(read_f32(&obuf, rows));
 }
 
