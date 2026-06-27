@@ -70,6 +70,26 @@ fn bench_matvec(c: &mut Criterion) {
             }
         });
     });
+    // The actual production CPU path (rayon-parallel over rows) — the honest
+    // baseline for the GPU numbers below. `scalar`/`simd` above isolate the
+    // single-row kernel.
+    group.bench_function("cpu_parallel", |b| {
+        b.iter(|| talos::math::matmul::matvec(black_box(&w), black_box(&x), &mut out, rows, cols));
+    });
+    // M7 vs M8.0: uploading the weight every call (the per-token cost) vs keeping
+    // it resident on the GPU.
+    #[cfg(feature = "metal")]
+    {
+        use talos::math::metal;
+        group.bench_function("gpu_upload", |b| {
+            b.iter(|| metal::matvec_f32(black_box(&w), black_box(&x), &mut out, rows, cols));
+        });
+        group.bench_function("gpu_resident", |b| {
+            b.iter(|| {
+                metal::matvec_f32_resident("bench.w", black_box(&w), black_box(&x), &mut out, rows, cols)
+            });
+        });
+    }
     group.finish();
 }
 

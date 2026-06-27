@@ -25,12 +25,23 @@ pub struct QTensor<'a> {
     dtype: GgmlType,
     rows: usize,
     cols: usize,
+    /// Tensor name, the key for the resident GPU weight buffer (M8.0). Only the
+    /// Metal path needs it, so the CPU build stays allocation-free.
+    #[cfg(feature = "metal")]
+    name: String,
 }
 
 impl<'a> QTensor<'a> {
     fn bind(g: &'a GgufFile, name: &str, rows: usize, cols: usize) -> Result<Self> {
         let (bytes, dtype) = g.tensor_raw(name)?;
-        Ok(QTensor { bytes, dtype, rows, cols })
+        Ok(QTensor {
+            bytes,
+            dtype,
+            rows,
+            cols,
+            #[cfg(feature = "metal")]
+            name: name.to_string(),
+        })
     }
 
     /// `out[m] = <row m, x>`, dequantizing on the fly for quantized dtypes.
@@ -40,10 +51,23 @@ impl<'a> QTensor<'a> {
     pub fn matvec(&self, x: &[f32], out: &mut [f32]) {
         #[cfg(feature = "metal")]
         match self.dtype {
-            GgmlType::F32 => {
-                metal::matvec_f32(bytemuck::cast_slice(self.bytes), x, out, self.rows, self.cols)
-            }
-            _ => metal::matvec_quant(self.bytes, self.dtype, x, out, self.rows, self.cols),
+            GgmlType::F32 => metal::matvec_f32_resident(
+                &self.name,
+                bytemuck::cast_slice(self.bytes),
+                x,
+                out,
+                self.rows,
+                self.cols,
+            ),
+            _ => metal::matvec_quant_resident(
+                &self.name,
+                self.bytes,
+                self.dtype,
+                x,
+                out,
+                self.rows,
+                self.cols,
+            ),
         }
         #[cfg(not(feature = "metal"))]
         match self.dtype {

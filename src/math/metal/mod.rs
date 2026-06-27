@@ -34,6 +34,11 @@ struct MetalCtx {
     library: Library,
     /// Compiled pipelines, keyed by kernel name (built on first use).
     pipelines: RefCell<HashMap<&'static str, ComputePipelineState>>,
+    /// M8.0: weight buffers uploaded once and reused across tokens, keyed by
+    /// tensor name. Stores byte length too, so a reload with a different-sized
+    /// tensor of the same name re-uploads rather than serving a stale buffer.
+    /// Assumes one model per process (names are unique within a model).
+    weights: RefCell<HashMap<String, (usize, metal::Buffer)>>,
 }
 
 impl MetalCtx {
@@ -44,7 +49,26 @@ impl MetalCtx {
         let library = device
             .new_library_with_source(src, &CompileOptions::new())
             .expect("compile kernels.metal");
-        MetalCtx { device, queue, library, pipelines: RefCell::new(HashMap::new()) }
+        MetalCtx {
+            device,
+            queue,
+            library,
+            pipelines: RefCell::new(HashMap::new()),
+            weights: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Return the resident GPU buffer for weight tensor `key`, uploading it on
+    /// first use (or if a different-sized tensor was previously cached there).
+    fn resident_weight(&self, key: &str, bytes: &[u8]) -> metal::Buffer {
+        if let Some((len, buf)) = self.weights.borrow().get(key) {
+            if *len == bytes.len() {
+                return buf.clone();
+            }
+        }
+        let buf = self.buffer_from(bytes);
+        self.weights.borrow_mut().insert(key.to_string(), (bytes.len(), buf.clone()));
+        buf
     }
 
     fn pipeline(&self, name: &'static str) -> ComputePipelineState {
@@ -119,30 +143,55 @@ pub fn vadd(a: &[f32], b: &[f32], out: &mut [f32]) {
     });
 }
 
+/// The matvec launch itself, given a weight buffer (resident or freshly
+/// uploaded). `x`/`out` are small, so they stay per-call buffers.
+fn run_matvec(
+    ctx: &MetalCtx,
+    kernel: &'static str,
+    wbuf: &metal::Buffer,
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    let pipe = ctx.pipeline(kernel);
+    let xbuf = ctx.buffer_from(bytemuck::cast_slice(x));
+    let obuf = ctx.out_buffer(rows);
+    let cols_u32 = cols as u32;
+    dispatch_1d(ctx, &pipe, rows, |enc| {
+        enc.set_buffer(0, Some(wbuf), 0);
+        enc.set_buffer(1, Some(&xbuf), 0);
+        enc.set_buffer(2, Some(&obuf), 0);
+        enc.set_bytes(3, 4, &cols_u32 as *const u32 as *const c_void);
+    });
+    out.copy_from_slice(read_f32(&obuf, rows));
+}
+
+/// Kernel name for a block-quantized dtype.
+fn quant_kernel(dtype: crate::gguf::GgmlType) -> &'static str {
+    use crate::gguf::GgmlType;
+    match dtype {
+        GgmlType::Q8_0 => "matvec_q8_0",
+        GgmlType::Q4_0 => "matvec_q4_0",
+        GgmlType::F32 => unreachable!("F32 uses matvec_f32"),
+    }
+}
+
 /// M7.1: `out[m] = <row m of w, x>` for an F32 weight `[rows, cols]` (row-major).
-/// Mirrors `math::matmul::matvec`, on the GPU.
+/// Uploads the weight each call — used by tests; inference uses the `_resident`
+/// variant. Mirrors `math::matmul::matvec`, on the GPU.
 pub fn matvec_f32(w: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
     debug_assert_eq!(w.len(), rows * cols);
     debug_assert_eq!(x.len(), cols);
     debug_assert_eq!(out.len(), rows);
     CTX.with(|ctx| {
-        let pipe = ctx.pipeline("matvec_f32");
         let wbuf = ctx.buffer_from(bytemuck::cast_slice(w));
-        let xbuf = ctx.buffer_from(bytemuck::cast_slice(x));
-        let obuf = ctx.out_buffer(rows);
-        let cols_u32 = cols as u32;
-        dispatch_1d(ctx, &pipe, rows, |enc| {
-            enc.set_buffer(0, Some(&wbuf), 0);
-            enc.set_buffer(1, Some(&xbuf), 0);
-            enc.set_buffer(2, Some(&obuf), 0);
-            enc.set_bytes(3, 4, &cols_u32 as *const u32 as *const c_void);
-        });
-        out.copy_from_slice(read_f32(&obuf, rows));
+        run_matvec(ctx, "matvec_f32", &wbuf, x, out, rows, cols);
     });
 }
 
-/// M7.3: `out[m] = <dequant(row m), x>` for a block-quantized weight, with the
-/// dequant fused into the kernel. Mirrors `math::quant::matvec`, on the GPU.
+/// M7.3: fused dequant + matvec for a block-quantized weight (per-call upload).
+/// Mirrors `math::quant::matvec`, on the GPU.
 pub fn matvec_quant(
     bytes: &[u8],
     dtype: crate::gguf::GgmlType,
@@ -151,28 +200,43 @@ pub fn matvec_quant(
     rows: usize,
     cols: usize,
 ) {
-    use crate::gguf::GgmlType;
-    let kernel = match dtype {
-        GgmlType::Q8_0 => "matvec_q8_0",
-        GgmlType::Q4_0 => "matvec_q4_0",
-        GgmlType::F32 => unreachable!("F32 uses matvec_f32"),
-    };
     debug_assert_eq!(cols % dtype.block_elems(), 0);
     debug_assert_eq!(x.len(), cols);
     debug_assert_eq!(out.len(), rows);
     CTX.with(|ctx| {
-        let pipe = ctx.pipeline(kernel);
         let wbuf = ctx.buffer_from(bytes);
-        let xbuf = ctx.buffer_from(bytemuck::cast_slice(x));
-        let obuf = ctx.out_buffer(rows);
-        let cols_u32 = cols as u32;
-        dispatch_1d(ctx, &pipe, rows, |enc| {
-            enc.set_buffer(0, Some(&wbuf), 0);
-            enc.set_buffer(1, Some(&xbuf), 0);
-            enc.set_buffer(2, Some(&obuf), 0);
-            enc.set_bytes(3, 4, &cols_u32 as *const u32 as *const c_void);
-        });
-        out.copy_from_slice(read_f32(&obuf, rows));
+        run_matvec(ctx, quant_kernel(dtype), &wbuf, x, out, rows, cols);
+    });
+}
+
+/// M8.0: F32 matvec using the weight resident on the GPU (uploaded once, keyed
+/// by tensor `name`). This is the inference path — no per-token weight upload.
+pub fn matvec_f32_resident(name: &str, w: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
+    debug_assert_eq!(w.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(out.len(), rows);
+    CTX.with(|ctx| {
+        let wbuf = ctx.resident_weight(name, bytemuck::cast_slice(w));
+        run_matvec(ctx, "matvec_f32", &wbuf, x, out, rows, cols);
+    });
+}
+
+/// M8.0: fused dequant + matvec using the resident quantized weight.
+pub fn matvec_quant_resident(
+    name: &str,
+    bytes: &[u8],
+    dtype: crate::gguf::GgmlType,
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(cols % dtype.block_elems(), 0);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(out.len(), rows);
+    CTX.with(|ctx| {
+        let wbuf = ctx.resident_weight(name, bytes);
+        run_matvec(ctx, quant_kernel(dtype), &wbuf, x, out, rows, cols);
     });
 }
 
@@ -253,6 +317,48 @@ mod tests {
             for m in 0..rows {
                 assert!(close(gpu[m], cpu[m]), "{dtype:?} row {m}: gpu {} vs cpu {}", gpu[m], cpu[m]);
             }
+        }
+    }
+
+    #[test]
+    fn resident_weight_is_cached() {
+        // Upload wa under a key, then call again with *different* bytes wb under
+        // the SAME key: the result must reflect the cached wa, proving the weight
+        // was reused and not re-uploaded.
+        let mut rng = rand::thread_rng();
+        let (rows, cols) = (64usize, 128usize);
+        let wa: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let wb: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let x: Vec<f32> = (0..cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let mut cpu_a = vec![0.0f32; rows];
+        crate::math::matmul::matvec(&wa, &x, &mut cpu_a, rows, cols);
+
+        let key = "test::resident_weight_is_cached";
+        let mut g1 = vec![0.0f32; rows];
+        matvec_f32_resident(key, &wa, &x, &mut g1, rows, cols); // uploads wa
+        let mut g2 = vec![0.0f32; rows];
+        matvec_f32_resident(key, &wb, &x, &mut g2, rows, cols); // must reuse wa
+
+        for m in 0..rows {
+            assert!(close(g1[m], cpu_a[m]), "first call should match wa");
+            assert!(close(g2[m], cpu_a[m]), "cached call should still use wa, not wb");
+        }
+    }
+
+    #[test]
+    fn matvec_quant_resident_matches_cpu() {
+        let mut rng = rand::thread_rng();
+        let (rows, cols) = (96usize, 128usize);
+        let w: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let x: Vec<f32> = (0..cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let bytes = quant_rows(&w, rows, cols, quant_q8_0);
+        let dtype = crate::gguf::GgmlType::Q8_0;
+        let mut cpu = vec![0.0f32; rows];
+        crate::math::quant::matvec(&bytes, dtype, &x, &mut cpu, rows, cols);
+        let mut gpu = vec![0.0f32; rows];
+        matvec_quant_resident("test::quant_resident", &bytes, dtype, &x, &mut gpu, rows, cols);
+        for m in 0..rows {
+            assert!(close(gpu[m], cpu[m]), "row {m}: gpu {} vs cpu {}", gpu[m], cpu[m]);
         }
     }
 

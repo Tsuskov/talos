@@ -23,11 +23,16 @@ trainer's logits. `cargo test` is green; `cargo bench` reports throughput.
 
 M7 (opt-in, `--features metal`) moves the matvec hot path — F32 and fused
 dequant for Q8_0/Q4_0 — onto the Apple GPU, one thread per output row, verified
-against the CPU kernels (`cargo test --features metal`). It is a **correctness**
-milestone, not yet a speed one: rmsnorm/rope/attention stay on the CPU and
-weights re-upload each call, so the per-layer round-trips mean it is not faster
-than the SIMD CPU path. Keeping weights resident and porting the rest of the
-forward pass — the actual throughput win — is M8.
+against the CPU kernels (`cargo test --features metal`).
+
+M8.0 keeps each weight tensor resident on the GPU (uploaded once at first use,
+keyed by name) instead of re-uploading it every call. On a 4096×4096 matvec that
+is a **6.3×** speedup over M7's per-call upload (6.98 ms → 1.10 ms;
+`cargo bench --features metal -- matvec_4096`). Honest caveat: it is still ~2×
+slower than the rayon CPU path (0.50 ms), because each matvec is its own command
+buffer (commit/wait overhead) and the kernel is naive (adjacent threads read
+`cols` apart — poor coalescing). Beating the CPU needs one command buffer per
+token (whole forward on GPU) and a coalesced/simdgroup-reduction kernel — M8.1+.
 
 | Milestone | What | Verify |
 |-----------|------|--------|
@@ -39,6 +44,7 @@ forward pass — the actual throughput win — is M8.
 | M5 | SIMD matmul + fused dequant | tok/s vs llama.cpp (`benches/tokps.rs`) |
 | M6 | Perplexity harness (`talos perplexity`) | uniform logits score `ln(vocab)`; quant perplexity tracks F32 |
 | M7 | Metal GPU matvec (F32 + fused Q8_0/Q4_0), opt-in `--features metal` | GPU logits match the CPU kernels (`cargo test --features metal`) |
+| M8.0 | Resident weights (upload once, keyed by name) | cached buffer is reused, not re-uploaded (`resident_weight_is_cached`); 6.3× over per-call upload |
 
 ## Usage
 
