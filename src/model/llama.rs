@@ -155,6 +155,20 @@ impl Model {
         crate::math::metal::forward(cfg, &w, &x, pos, &mut self.gpu_kv)
     }
 
+    /// One decode step using the fastest available backend: the Metal GPU
+    /// forward when built with `--features metal`, otherwise the CPU forward.
+    /// This is what the `run` CLI uses.
+    pub fn step(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        #[cfg(feature = "metal")]
+        {
+            self.forward_gpu(token, pos)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            self.forward(token, pos)
+        }
+    }
+
     /// Reset the KV cache to start a fresh sequence.
     pub fn reset(&mut self) {
         self.kv.clear();

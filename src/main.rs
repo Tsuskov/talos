@@ -84,7 +84,7 @@ fn run(args: &[String]) -> Result<()> {
     let mut pos = 0usize;
     let mut logits = Vec::new();
     for &t in &prompt_ids {
-        logits = model.forward(t, pos);
+        logits = model.step(t, pos);
         pos += 1;
     }
 
@@ -102,7 +102,7 @@ fn run(args: &[String]) -> Result<()> {
         }
         out_ids.push(next);
         printed = flush_new(&model.tokenizer.decode(&out_ids), printed, &mut stdout);
-        logits = model.forward(next, pos);
+        logits = model.step(next, pos);
         pos += 1;
     }
     println!();
