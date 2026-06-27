@@ -16,9 +16,10 @@ The companion project trains the model and exports the GGUF; Talos runs it.
 
 ## Status
 
-M0–M5 implemented, plus grouped-query attention: GGUF reader, byte-BPE
-tokenizer, math kernels, and the
-Llama forward pass with a KV cache, verified against the trainer's logits.
+M0–M6 implemented, plus grouped-query attention: GGUF reader, byte-BPE
+tokenizer, math kernels, the Llama forward pass with a KV cache, sampling,
+quantized inference, and a perplexity harness — all verified against the
+trainer's logits. `cargo test` is green; `cargo bench` reports throughput.
 
 | Milestone | What | Verify |
 |-----------|------|--------|
@@ -26,14 +27,16 @@ Llama forward pass with a KV cache, verified against the trainer's logits.
 | M1 | Byte-BPE tokenizer | `decode(encode(s)) == s` |
 | M2 | F32 forward + KV cache, greedy decode | first-token logits match the trainer within 1e-4 (`tests/parity.rs`) |
 | M3 | Sampling (temp / top-k / top-p) + `run` CLI | coherent generations; temp=0 == greedy |
-| M4 | Quantization (Q8_0, Q4_0) | perplexity within a few % of F32; ~4× smaller |
+| M4 | Quantization (Q8_0, Q4_0) | quantized logits & perplexity stay within budget of F32 (`tests/quant.rs`) |
 | M5 | SIMD matmul + fused dequant | tok/s vs llama.cpp (`benches/tokps.rs`) |
+| M6 | Perplexity harness (`talos perplexity`) | uniform logits score `ln(vocab)`; quant perplexity tracks F32 |
 
-## Usage (target)
+## Usage
 
 ```sh
 talos inspect models/tiny.gguf
 talos run models/tiny.gguf --prompt "Once upon a time" -n 128 --temp 0.8
+talos perplexity models/tiny.gguf corpus.txt   # the honest quality number
 ```
 
 ## Layout
@@ -45,6 +48,7 @@ src/math/      rmsnorm, rope, softmax, swiglu, matvec
 src/model/     config, weight handles, Llama forward pass
 src/kv_cache   per-layer key/value cache
 src/sample     logit sampling
+src/eval       teacher-forced perplexity
 tests/parity   the numerical contract
 benches/tokps  throughput
 ```

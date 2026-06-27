@@ -71,3 +71,33 @@ fn quantized_logits_track_f32() {
         assert!(d <= 0.5, "q4_0 diff {d} too large");
     }
 }
+
+/// M6: quantization should barely move perplexity. This is the claim the M4 row
+/// makes ("perplexity within a few %"), measured directly: teacher-forced
+/// perplexity on the fixed prompt for each export, asserting the quantized
+/// models stay within budget of the F32 perplexity.
+#[test]
+fn quantized_perplexity_tracks_f32() {
+    if !Path::new(F32_MODEL).exists() {
+        eprintln!("skipping perplexity test: {F32_MODEL} absent (regenerate from Hephaistos)");
+        return;
+    }
+    let ppl = |path: &str| -> Option<f32> {
+        if !Path::new(path).exists() {
+            return None;
+        }
+        let mut model = talos::model::Model::load(Path::new(path)).expect("load");
+        Some(talos::eval::perplexity(&mut model, &PROMPT[..]))
+    };
+
+    let f32_ppl = ppl(F32_MODEL).unwrap();
+    eprintln!("perplexity f32  {f32_ppl:.4}");
+    if let Some(q8) = ppl("models/tiny32_q8.gguf") {
+        eprintln!("perplexity q8_0 {q8:.4} ({:+.1}%)", 100.0 * (q8 / f32_ppl - 1.0));
+        assert!(q8 <= f32_ppl * 1.05, "q8_0 perplexity {q8} >> f32 {f32_ppl}");
+    }
+    if let Some(q4) = ppl("models/tiny32_q4.gguf") {
+        eprintln!("perplexity q4_0 {q4:.4} ({:+.1}%)", 100.0 * (q4 / f32_ppl - 1.0));
+        assert!(q4 <= f32_ppl * 1.5, "q4_0 perplexity {q4} >> f32 {f32_ppl}");
+    }
+}
