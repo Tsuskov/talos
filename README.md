@@ -91,4 +91,5 @@ tests/forward_gpu  GPU-forward == CPU-forward (M8.2, --features metal)
 benches/tokps  throughput
 ```
 
-See `BUILD.md` for module ownership and the parallel build plan.
+See [`WRITEUP.md`](WRITEUP.md) for the story: building the CPU engine and the
+Metal GPU backend from scratch, and the numbers at each step.
