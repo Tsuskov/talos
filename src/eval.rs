@@ -24,19 +24,31 @@ pub fn token_nll(logits: &[f32], target: u32) -> f32 {
 
 /// Teacher-forced perplexity of `tokens` under `model`.
 ///
-/// Feeds `tokens[0..n-1]` in order (resetting the KV cache first) and, at each
-/// position, accumulates the NLL the model assigns to the *next* token. Returns
-/// `exp(mean NLL)`. Requires at least two tokens; panics otherwise, since
-/// perplexity is undefined without a single prediction to score.
+/// Splits the tokens into non-overlapping chunks of `context_length` (the same
+/// way `llama.cpp`'s perplexity tool does) and scores each chunk from a fresh
+/// KV cache — positions past the trained context would otherwise put RoPE into
+/// territory the model never saw and inflate the number. Within a chunk, each
+/// position accumulates the NLL the model assigns to the *next* token. Returns
+/// `exp(mean NLL)` over all scored positions. Requires at least two tokens;
+/// panics otherwise, since perplexity is undefined without a single prediction
+/// to score.
 pub fn perplexity(model: &mut Model, tokens: &[u32]) -> f32 {
     assert!(tokens.len() >= 2, "perplexity needs at least 2 tokens");
-    model.reset();
+    let ctx = model.cfg.context_length;
     let mut nll = 0.0f64;
-    for (pos, pair) in tokens.windows(2).enumerate() {
-        let logits = model.forward(pair[0], pos);
-        nll += token_nll(&logits, pair[1]) as f64;
+    let mut scored = 0usize;
+    for chunk in tokens.chunks(ctx) {
+        if chunk.len() < 2 {
+            break; // a trailing single token has nothing to predict
+        }
+        model.reset();
+        for (pos, pair) in chunk.windows(2).enumerate() {
+            let logits = model.forward(pair[0], pos);
+            nll += token_nll(&logits, pair[1]) as f64;
+            scored += 1;
+        }
     }
-    (nll / tokens.windows(2).count() as f64).exp() as f32
+    (nll / scored as f64).exp() as f32
 }
 
 #[cfg(test)]
