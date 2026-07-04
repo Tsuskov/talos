@@ -14,13 +14,16 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-memmap2 = "0.9"
 bytemuck = "1"
-rayon = "1"
 rand = "0.8"
 half = "2"
 wide = "0.7"
 metal = { version = "0.29", optional = true }
+
+# Native-only: wasm has no filesystem (memmap2) and no threads (rayon).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = "0.9"
+rayon = "1"
 
 [features]
 # M7: run the matvec hot path on the Apple GPU. Off by default so CPU builds

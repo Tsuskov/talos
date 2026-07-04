@@ -32,9 +32,17 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// `out[m] = sum_k w[m*cols + k] * x[k]` for m in 0..rows.
 /// `w.len() == rows*cols`, `x.len() == cols`, `out.len() == rows`.
 pub fn matvec(w: &[f32], x: &[f32], out: &mut [f32], _rows: usize, cols: usize) {
-    use rayon::prelude::*;
-    out.par_iter_mut()
-        .zip(w.par_chunks(cols))
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        out.par_iter_mut()
+            .zip(w.par_chunks(cols))
+            .for_each(|(o, row)| *o = dot(row, x));
+    }
+    // wasm has no threads: same kernel, sequential over output rows.
+    #[cfg(target_arch = "wasm32")]
+    out.iter_mut()
+        .zip(w.chunks(cols))
         .for_each(|(o, row)| *o = dot(row, x));
 }
 

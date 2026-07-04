@@ -9,9 +9,11 @@
 //! `bytemuck::cast_slice::<u8, f32>` is safe on each tensor's byte range.
 
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::Mmap;
 
 use super::dtype::GgmlType;
@@ -46,13 +48,32 @@ impl TensorInfo {
     }
 }
 
-/// A memory-mapped GGUF file with its metadata and tensor index parsed.
+/// A GGUF file with its metadata and tensor index parsed.
 pub struct GgufFile {
-    _mmap: Mmap,
+    backing: Backing,
     meta: HashMap<String, MetaValue>,
     tensors: Vec<TensorInfo>,
     tensor_by_name: HashMap<String, usize>,
     data_start: usize,
+}
+
+/// Bytes backing the file: an mmap on native targets, an owned buffer when
+/// parsed from bytes (the only option on wasm, which has no filesystem).
+enum Backing {
+    #[cfg(not(target_arch = "wasm32"))]
+    Mmap(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for Backing {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Mmap(m) => m,
+            Backing::Owned(v) => v,
+        }
+    }
 }
 
 /// Cursor over the mmap'd bytes that bounds-checks every read.
@@ -145,6 +166,7 @@ fn read_value(c: &mut Cursor, tag: u32) -> Result<MetaValue> {
 impl GgufFile {
     /// Mmap and parse `path`. Errors on bad magic, unsupported version, or a
     /// truncated/malformed index.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)
             .with_context(|| format!("opening {}", path.display()))?;
@@ -152,8 +174,17 @@ impl GgufFile {
         // expose immutable views into it.
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("mmapping {}", path.display()))?;
+        Self::parse(Backing::Mmap(mmap))
+    }
 
-        let mut c = Cursor::new(&mmap);
+    /// Parse a GGUF file already loaded into memory — the path used on wasm,
+    /// where the model arrives as fetched bytes instead of a file.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        Self::parse(Backing::Owned(bytes))
+    }
+
+    fn parse(backing: Backing) -> Result<Self> {
+        let mut c = Cursor::new(&backing);
 
         let magic = c.take(4)?;
         if magic != b"GGUF" {
@@ -194,12 +225,12 @@ impl GgufFile {
 
         // Pad to the 32-byte-aligned data section start.
         let data_start = c.pos.div_ceil(ALIGNMENT) * ALIGNMENT;
-        if data_start > mmap.len() {
-            bail!("data section start {data_start} past end of file {}", mmap.len());
+        if data_start > backing.len() {
+            bail!("data section start {data_start} past end of file {}", backing.len());
         }
 
         Ok(Self {
-            _mmap: mmap,
+            backing,
             meta,
             tensors,
             tensor_by_name,
@@ -273,10 +304,10 @@ impl GgufFile {
         let end = start
             .checked_add(byte_len)
             .ok_or_else(|| anyhow!("tensor byte range overflow"))?;
-        if end > self._mmap.len() {
+        if end > self.backing.len() {
             bail!("tensor {name:?} data range past end of file");
         }
-        Ok(bytemuck::cast_slice(&self._mmap[start..end]))
+        Ok(bytemuck::cast_slice(&self.backing[start..end]))
     }
 
     /// Raw tensor bytes plus dtype, for any supported type (F32 or quantized).
@@ -300,10 +331,10 @@ impl GgufFile {
         let end = start
             .checked_add(byte_len)
             .ok_or_else(|| anyhow!("tensor byte range overflow"))?;
-        if end > self._mmap.len() {
+        if end > self.backing.len() {
             bail!("tensor {name:?} data range past end of file");
         }
-        Ok((&self._mmap[start..end], info.dtype))
+        Ok((&self.backing[start..end], info.dtype))
     }
 }
 

@@ -5,6 +5,7 @@
 //! and immediately consumed by the SIMD dot, so there is no per-row heap
 //! allocation and no full-row dequant pass. Parallel over output rows.
 
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::gguf::dtype::QK;
@@ -20,7 +21,7 @@ pub fn matvec(bytes: &[u8], dtype: GgmlType, x: &[f32], out: &mut [f32], rows: u
     debug_assert_eq!(bytes.len(), rows * row_bytes);
     debug_assert_eq!(cols % QK, 0);
 
-    out.par_iter_mut().enumerate().for_each(|(m, o)| {
+    let per_row = |(m, o): (usize, &mut f32)| {
         let row = &bytes[m * row_bytes..(m + 1) * row_bytes];
         let mut sum = 0.0f32;
         let mut block = [0.0f32; QK];
@@ -29,5 +30,10 @@ pub fn matvec(bytes: &[u8], dtype: GgmlType, x: &[f32], out: &mut [f32], rows: u
             sum += dot(&block, xb);
         }
         *o = sum;
-    });
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    out.par_iter_mut().enumerate().for_each(per_row);
+    // wasm has no threads: same kernel, sequential over output rows.
+    #[cfg(target_arch = "wasm32")]
+    out.iter_mut().enumerate().for_each(per_row);
 }

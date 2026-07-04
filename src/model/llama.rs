@@ -8,6 +8,7 @@
 //! Must match Hephaistos numerically (tests/parity.rs).
 
 use anyhow::{bail, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use crate::gguf::GgufFile;
@@ -28,8 +29,18 @@ pub struct Model {
 
 impl Model {
     /// Load a GGUF model from disk (config + tokenizer + weights + fresh cache).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(path: &Path) -> Result<Self> {
-        let gguf = GgufFile::open(path)?;
+        Self::from_gguf(GgufFile::open(path)?)
+    }
+
+    /// Build a model from GGUF bytes already in memory — the wasm path, where
+    /// the model arrives as fetched bytes instead of a file.
+    pub fn load_bytes(bytes: Vec<u8>) -> Result<Self> {
+        Self::from_gguf(GgufFile::from_bytes(bytes)?)
+    }
+
+    fn from_gguf(gguf: GgufFile) -> Result<Self> {
         let cfg = Config::from_gguf(&gguf)?;
         if cfg.n_head_kv == 0 || cfg.n_head % cfg.n_head_kv != 0 {
             bail!(
