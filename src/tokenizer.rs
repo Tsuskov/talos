@@ -160,19 +160,23 @@ impl Tokenizer {
 
     /// Encode UTF-8 text to token ids (no BOS/EOS added; caller decides).
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        // Map raw bytes into the byte-level alphabet, then run BPE over the
-        // whole sequence (no pre-tokenization regex; the merge ranks encode
-        // word boundaries via the leading-space marker in the vocab).
-        let mapped: String = text
-            .bytes()
-            .map(|b| self.byte_encoder[b as usize])
-            .collect();
-
+        // Pre-tokenize like Cadmus (split at spaces, a leading space attaching
+        // to the word that follows), then run BPE per word. The merge loop is
+        // quadratic in unit length, so running it over the whole input made
+        // encode hang on megabyte files; per-word units keep it linear. For
+        // vocabs trained with this splitter (Cadmus) no merge crosses a word
+        // boundary, so the ids are identical to whole-text BPE.
         let mut ids = Vec::new();
-        for piece in self.bpe(&mapped) {
-            match self.token_to_id.get(&piece) {
-                Some(&id) => ids.push(id),
-                None => ids.push(self.unk),
+        for word in pretokenize(text) {
+            let mapped: String = word
+                .bytes()
+                .map(|b| self.byte_encoder[b as usize])
+                .collect();
+            for piece in self.bpe(&mapped) {
+                match self.token_to_id.get(&piece) {
+                    Some(&id) => ids.push(id),
+                    None => ids.push(self.unk),
+                }
             }
         }
         ids
@@ -202,6 +206,24 @@ impl Tokenizer {
     pub fn eos(&self) -> u32 {
         self.eos
     }
+}
+
+/// Split text into BPE units, a leading space attaching to the word that
+/// follows (" world" is one unit) — the same rule as Cadmus's pretokenizer.
+/// Only splits, never drops a byte, so decode(encode(s)) == s is preserved.
+fn pretokenize(text: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        if c == ' ' && i > start {
+            words.push(&text[start..i]);
+            start = i;
+        }
+    }
+    if start < text.len() {
+        words.push(&text[start..]);
+    }
+    words
 }
 
 #[cfg(test)]
@@ -275,6 +297,27 @@ mod tests {
         let ids = tok.encode("hello");
         assert_eq!(ids.len(), 1, "expected merges to collapse 'hello' to 1 token");
         assert_eq!(tok.decode(&ids), "hello");
+    }
+
+    #[test]
+    fn pretokenize_splits_like_cadmus() {
+        assert_eq!(pretokenize("hello world"), vec!["hello", " world"]);
+        assert_eq!(pretokenize(" leading"), vec![" leading"]);
+        // Runs of spaces become single-space units (Cadmus convention).
+        assert_eq!(pretokenize("a  b"), vec!["a", " ", " b"]);
+        // Newlines do not split; they stay inside their unit.
+        assert_eq!(pretokenize("a\nb c"), vec!["a\nb", " c"]);
+        assert_eq!(pretokenize(""), Vec::<&str>::new());
+    }
+
+    /// Regression test for the O(n^2) whole-text merge loop: encoding a few
+    /// hundred KB must terminate (it used to effectively hang on MB inputs).
+    #[test]
+    fn encode_scales_to_large_inputs() {
+        let tok = make_tokenizer();
+        let text = "hello world, hello again.\n".repeat(12_000); // ~300 KB
+        let ids = tok.encode(&text);
+        assert_eq!(tok.decode(&ids), text);
     }
 
     #[test]
