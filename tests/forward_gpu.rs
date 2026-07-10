@@ -191,3 +191,38 @@ fn forward_gpu_matches_cpu() {
 
     std::fs::remove_file(&path).ok();
 }
+
+/// Same safety net for the embedding hook: the GPU `forward_hidden` must match
+/// the CPU one over a growing KV cache.
+#[test]
+fn forward_hidden_gpu_matches_cpu() {
+    let bytes = build_model_gguf();
+    let mut path = std::env::temp_dir();
+    path.push(format!("talos_hidden_{}.gguf", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+    }
+
+    let mut model = Model::load(&path).expect("load synthetic model");
+    let vocab = model.cfg.vocab_size as u32;
+    let n_embd = model.cfg.n_embd;
+    let prompt: [u32; 6] = [1, 3, 5, 7, 2, 4];
+
+    let mut max_rel = 0.0f32;
+    for (pos, &tok) in prompt.iter().enumerate() {
+        let tok = tok % vocab;
+        let cpu = model.forward_hidden(tok, pos);
+        let gpu = model.forward_hidden_gpu(tok, pos);
+        assert_eq!(cpu.len(), n_embd);
+        assert_eq!(gpu.len(), n_embd);
+        for (a, b) in gpu.iter().zip(&cpu) {
+            max_rel = max_rel.max((a - b).abs() / b.abs().max(1.0));
+        }
+    }
+    eprintln!("forward_hidden GPU vs CPU: max rel {max_rel:e}");
+    assert!(max_rel <= 1e-3, "GPU hidden state diverged from CPU: max rel {max_rel:e}");
+
+    std::fs::remove_file(&path).ok();
+}

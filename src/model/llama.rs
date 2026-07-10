@@ -64,6 +64,17 @@ impl Model {
     /// Run one decode step for `token` at sequence position `pos`, returning
     /// logits over the vocabulary. Appends this step's keys/values to the cache.
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        let xf = self.forward_hidden(token, pos);
+        let w = Weights::from_gguf(&self.gguf, &self.cfg).expect("weights bind");
+        let mut logits = vec![0.0f32; self.cfg.vocab_size];
+        w.output.matvec(&xf, &mut logits);
+        logits
+    }
+
+    /// Run one decode step like [`Model::forward`], but return the final-norm
+    /// hidden state `xf` (n_embd) instead of projecting to logits. Mean-pooling
+    /// these per-position states over a sequence yields its embedding.
+    pub fn forward_hidden(&mut self, token: u32, pos: usize) -> Vec<f32> {
         // Disjoint field borrows: `w`/`cfg` shared, `kv` mutable.
         let cfg = &self.cfg;
         let kv = &mut self.kv;
@@ -146,12 +157,10 @@ impl Model {
             }
         }
 
-        // Final norm + output projection -> logits.
+        // Final norm; the output projection to logits happens in `forward`.
         let mut xf = vec![0.0f32; c];
         rmsnorm(&x, w.output_norm, eps, &mut xf);
-        let mut logits = vec![0.0f32; cfg.vocab_size];
-        w.output.matvec(&xf, &mut logits);
-        logits
+        xf
     }
 
     /// Run one decode step entirely on the GPU (M8.2): the whole forward pass in
@@ -166,6 +175,17 @@ impl Model {
         crate::math::metal::forward(cfg, &w, &x, pos, &mut self.gpu_kv)
     }
 
+    /// Like [`Model::forward_gpu`] but returns the final-norm hidden state
+    /// instead of logits — the GPU twin of [`Model::forward_hidden`].
+    #[cfg(feature = "metal")]
+    pub fn forward_hidden_gpu(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let w = Weights::from_gguf(&self.gguf, cfg).expect("weights bind");
+        let mut x = vec![0.0f32; cfg.n_embd];
+        w.token_embd.dequant_row(token as usize, &mut x);
+        crate::math::metal::forward_hidden(cfg, &w, &x, pos, &mut self.gpu_kv)
+    }
+
     /// One decode step using the fastest available backend: the Metal GPU
     /// forward when built with `--features metal`, otherwise the CPU forward.
     /// This is what the `run` CLI uses.
@@ -177,6 +197,19 @@ impl Model {
         #[cfg(not(feature = "metal"))]
         {
             self.forward(token, pos)
+        }
+    }
+
+    /// Final-norm hidden state via the fastest available backend (see
+    /// [`Model::step`]) — what embedders should call.
+    pub fn step_hidden(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        #[cfg(feature = "metal")]
+        {
+            self.forward_hidden_gpu(token, pos)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            self.forward_hidden(token, pos)
         }
     }
 

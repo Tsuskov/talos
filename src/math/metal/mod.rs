@@ -348,6 +348,30 @@ fn enc_1d(ctx: &MetalCtx, enc: &ComputeCommandEncoderRef, kernel: &'static str, 
 /// Run the full forward pass for one token on the GPU, returning the logits.
 /// `x_embed` is the token's embedding row (dequantized on the CPU by the caller).
 pub fn forward(cfg: &Config, w: &Weights, x_embed: &[f32], pos: usize, kv: &mut GpuKv) -> Vec<f32> {
+    forward_impl(cfg, w, x_embed, pos, kv, false)
+}
+
+/// Like [`forward`] but skips the output projection and reads back the
+/// final-norm hidden state `xf` (n_embd) — the GPU twin of the CPU
+/// `Model::forward_hidden`, used for embeddings.
+pub fn forward_hidden(
+    cfg: &Config,
+    w: &Weights,
+    x_embed: &[f32],
+    pos: usize,
+    kv: &mut GpuKv,
+) -> Vec<f32> {
+    forward_impl(cfg, w, x_embed, pos, kv, true)
+}
+
+fn forward_impl(
+    cfg: &Config,
+    w: &Weights,
+    x_embed: &[f32],
+    pos: usize,
+    kv: &mut GpuKv,
+    hidden_only: bool,
+) -> Vec<f32> {
     let c = cfg.n_embd;
     let nh = cfg.n_head;
     let nkv = cfg.n_head_kv;
@@ -475,16 +499,22 @@ pub fn forward(cfg: &Config, w: &Weights, x_embed: &[f32], pos: usize, kv: &mut 
             });
         }
 
-        // final norm + output projection
+        // final norm + output projection (skipped when only xf is wanted)
         let output_norm =
             ctx.resident_weight("output_norm.weight", bytemuck::cast_slice(w.output_norm));
         enc_rmsnorm(ctx, enc, &xb, &output_norm, &xf, c, eps);
-        enc_matvec(ctx, enc, &w.output, &xf, &logits);
+        if !hidden_only {
+            enc_matvec(ctx, enc, &w.output, &xf, &logits);
+        }
 
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
-        read_f32(&logits, vocab).to_vec()
+        if hidden_only {
+            read_f32(&xf, c).to_vec()
+        } else {
+            read_f32(&logits, vocab).to_vec()
+        }
     })
 }
 
