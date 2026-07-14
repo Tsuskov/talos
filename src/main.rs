@@ -68,6 +68,7 @@ fn run(args: &[String]) -> Result<()> {
     let prompt = opts.prompt.as_deref().ok_or_else(|| anyhow!("--prompt is required"))?;
 
     let mut model = Model::load(Path::new(model_path))?;
+    model.cap_context(opts.ctx);
     let mut rng = StdRng::seed_from_u64(opts.seed.unwrap_or_else(rand::random));
 
     let mut prompt_ids = Vec::new();
@@ -137,11 +138,15 @@ struct Opts {
     top_k: Option<usize>,
     top_p: Option<f32>,
     seed: Option<u64>,
+    ctx: usize,
 }
 
 impl Opts {
     fn parse(args: &[String]) -> Result<Self> {
-        let mut o = Opts { prompt: None, n: 64, temp: 0.8, top_k: None, top_p: None, seed: None };
+        // Cap the KV cache at 4096 positions by default: a model's own context
+        // (e.g. Mistral's 32768) sizes the GPU KV buffers to ~8.6 GB, far more
+        // than a CLI run needs. Raise it with --ctx for longer generations.
+        let mut o = Opts { prompt: None, n: 64, temp: 0.8, top_k: None, top_p: None, seed: None, ctx: 4096 };
         let mut it = args.iter();
         while let Some(flag) = it.next() {
             let mut val = || it.next().ok_or_else(|| anyhow!("{flag} needs a value"));
@@ -152,6 +157,7 @@ impl Opts {
                 "--top-k" => o.top_k = Some(val()?.parse().context("--top-k")?),
                 "--top-p" => o.top_p = Some(val()?.parse().context("--top-p")?),
                 "--seed" => o.seed = Some(val()?.parse().context("--seed")?),
+                "--ctx" => o.ctx = val()?.parse().context("--ctx")?,
                 other => bail!("unknown option {other}"),
             }
         }
@@ -161,6 +167,6 @@ impl Opts {
 
 fn usage_err() -> anyhow::Error {
     anyhow::anyhow!(
-        "usage:\n  talos inspect <model.gguf>\n  talos run <model.gguf> --prompt \"…\" [-n N] [--temp T] [--top-k K] [--top-p P] [--seed S]\n  talos perplexity <model.gguf> <text-file>"
+        "usage:\n  talos inspect <model.gguf>\n  talos run <model.gguf> --prompt \"…\" [-n N] [--temp T] [--top-k K] [--top-p P] [--seed S] [--ctx N]\n  talos perplexity <model.gguf> <text-file>"
     )
 }

@@ -61,6 +61,25 @@ impl Model {
         })
     }
 
+    /// Cap the context length this model's KV cache is sized for to `max_ctx`
+    /// (never above the model's own `context_length`). The GPU forward reserves
+    /// KV buffers for the full context — e.g. 32768 positions is ~8.6 GB across
+    /// 32 layers — which dwarfs a short generation; capping it keeps the run in
+    /// memory. Rebuilds a fresh, empty cache, so call before decoding.
+    pub fn cap_context(&mut self, max_ctx: usize) {
+        self.cfg.context_length = self.cfg.context_length.min(max_ctx.max(1));
+        self.kv = KvCache::new(
+            self.cfg.n_layer,
+            self.cfg.n_head_kv,
+            self.cfg.head_dim(),
+            self.cfg.context_length,
+        );
+        #[cfg(feature = "metal")]
+        {
+            self.gpu_kv = crate::math::metal::GpuKv::new();
+        }
+    }
+
     /// Run one decode step for `token` at sequence position `pos`, returning
     /// logits over the vocabulary. Appends this step's keys/values to the cache.
     pub fn forward(&mut self, token: u32, pos: usize) -> Vec<f32> {
