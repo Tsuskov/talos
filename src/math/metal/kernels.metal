@@ -95,6 +95,52 @@ kernel void matvec_q4_0(device const uchar* w    [[buffer(0)]],
     if (lane == 0) out[row] = acc;
 }
 
+// M10: Q6_K super-block (256 elements, 210 bytes: ql[128] low 4 bits, qh[64]
+// high 2 bits, scales[16] int8, d f16). Two halves of 128 elements, each with 8
+// int8 sub-scales; the assembled 6-bit quant is biased by -32. Mirrors
+// dtype.rs `dequantize` for Q6_K, accumulating the dot instead of storing.
+// One simdgroup per row; lanes split the row's super-blocks, then simd_sum.
+kernel void matvec_q6_k(device const uchar* w    [[buffer(0)]],
+                        device const float* x    [[buffer(1)]],
+                        device float*       out  [[buffer(2)]],
+                        constant uint&      cols [[buffer(3)]],
+                        uint  row  [[threadgroup_position_in_grid]],
+                        uint  lane [[thread_position_in_threadgroup]],
+                        uint  W    [[threads_per_threadgroup]]) {
+    const uint QK_K = 256, BB = 210;
+    uint nsb = cols / QK_K;
+    device const uchar* rp = w + (uint)row * nsb * BB;
+    float acc = 0.0f;
+    for (uint sb = lane; sb < nsb; sb += W) {
+        device const uchar* bp = rp + sb * BB;
+        float d = block_scale(bp + 208);
+        device const float* xb = x + sb * QK_K;
+        for (uint n = 0; n < 2; ++n) {
+            device const uchar* ql = bp + n * 64;
+            device const uchar* qh = bp + 128 + n * 32;
+            device const uchar* sc = bp + 192 + n * 8;
+            uint yb = n * 128;
+            for (uint l = 0; l < 32; ++l) {
+                uint is = l / 16;
+                int q1 = (int)((ql[l]      & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql[l]       >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                int s1 = (int)sc[is];     if (s1 > 127) s1 -= 256;
+                int s2 = (int)sc[is + 2]; if (s2 > 127) s2 -= 256;
+                int s3 = (int)sc[is + 4]; if (s3 > 127) s3 -= 256;
+                int s4 = (int)sc[is + 6]; if (s4 > 127) s4 -= 256;
+                acc += d * (float)s1 * (float)q1 * xb[yb + l];
+                acc += d * (float)s2 * (float)q2 * xb[yb + l + 32];
+                acc += d * (float)s3 * (float)q3 * xb[yb + l + 64];
+                acc += d * (float)s4 * (float)q4 * xb[yb + l + 96];
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) out[row] = acc;
+}
+
 // ---- M8.2: the rest of the forward pass, mirroring math::ops + the attention
 // in model::llama. One simdgroup-wide threadgroup is used for the reductions
 // (rmsnorm, softmax); the elementwise kernels are one thread per element.

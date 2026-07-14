@@ -184,6 +184,7 @@ fn quant_kernel(dtype: crate::gguf::GgmlType) -> &'static str {
     match dtype {
         GgmlType::Q8_0 => "matvec_q8_0",
         GgmlType::Q4_0 => "matvec_q4_0",
+        GgmlType::Q6K => "matvec_q6_k",
         GgmlType::F32 => unreachable!("F32 uses matvec_f32"),
     }
 }
@@ -648,6 +649,39 @@ mod tests {
     #[test]
     fn matvec_q4_0_matches_cpu() {
         check_quant(crate::gguf::GgmlType::Q4_0, quant_q4_0);
+    }
+
+    // Random *valid* Q6_K super-blocks (210 bytes: ql[128] qh[64] scales[16] d).
+    // Quantization quality is irrelevant here — the test only checks that the GPU
+    // kernel and the CPU dequant read the same bytes identically.
+    fn random_q6_k_rows(rows: usize, cols: usize, rng: &mut impl Rng) -> Vec<u8> {
+        let sb_per_row = cols / 256;
+        let mut bytes = Vec::with_capacity(rows * sb_per_row * 210);
+        for _ in 0..rows * sb_per_row {
+            for _ in 0..208 {
+                bytes.push(rng.gen::<u8>());
+            }
+            let d = half::f16::from_f32(rng.gen_range(-0.05..0.05));
+            bytes.extend_from_slice(&d.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn matvec_q6_k_matches_cpu() {
+        let mut rng = rand::thread_rng();
+        for (rows, cols) in [(64usize, 256usize), (200, 512), (1, 256), (3, 768)] {
+            let bytes = random_q6_k_rows(rows, cols, &mut rng);
+            let x: Vec<f32> = (0..cols).map(|_| rng.gen_range(-1.0..1.0)).collect();
+            let dtype = crate::gguf::GgmlType::Q6K;
+            let mut cpu = vec![0.0f32; rows];
+            crate::math::quant::matvec(&bytes, dtype, &x, &mut cpu, rows, cols);
+            let mut gpu = vec![0.0f32; rows];
+            matvec_quant(&bytes, dtype, &x, &mut gpu, rows, cols);
+            for m in 0..rows {
+                assert!(close(gpu[m], cpu[m]), "Q6_K row {m}: gpu {} vs cpu {}", gpu[m], cpu[m]);
+            }
+        }
     }
 
     #[test]
