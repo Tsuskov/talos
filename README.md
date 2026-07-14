@@ -64,6 +64,7 @@ per-dispatch overhead that held M8.1 back.
 | M8.1 | Coalesced simdgroup matvec (one simdgroup/row, `simd_sum`) | GPU logits still match CPU; 0.79 ms/matvec (1.4× over M8.0) |
 | M8.2 | Whole forward on GPU (`forward_gpu`): resident KV cache, one serial command buffer/token | GPU forward matches CPU to ~1e-7 + deterministic (`tests/forward_gpu.rs`); 2.8× (f32) / 3.7× (q4) decode vs CPU |
 | M9 | wasm32 build (browser UI: sister repo `talos-forge`); M9.1: fused simd128 Q4_0 dequant-dot | same seed-42 generations as the scalar-fallback wasm build; browser decode 4.6× (q4) / 2.5× (f32) over it |
+| M10 | Run a stock external model: SentencePiece tokenizer + Q6_K dequant | Mistral-7B-Instruct-v0.2 Q4_0 decodes coherently (`The capital of France is Paris…`); `cargo test` green + 3 SPM tests |
 
 ## Usage
 
