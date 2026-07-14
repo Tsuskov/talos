@@ -8,7 +8,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
-use crate::gguf::dtype::QK;
+use crate::gguf::dtype::QK_K;
 use crate::gguf::GgmlType;
 use crate::math::matmul::dot;
 
@@ -17,9 +17,10 @@ use crate::math::matmul::dot;
 /// size. F32 should use `matmul::matvec` instead (no dequant needed).
 pub fn matvec(bytes: &[u8], dtype: GgmlType, x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
     let bb = dtype.block_bytes();
-    let row_bytes = (cols / QK) * bb;
+    let be = dtype.block_elems();
+    let row_bytes = (cols / be) * bb;
     debug_assert_eq!(bytes.len(), rows * row_bytes);
-    debug_assert_eq!(cols % QK, 0);
+    debug_assert_eq!(cols % be, 0);
 
     // wasm-SIMD: fused dequant+dot for Q4_0, without the stack round-trip
     // through a dequantized block buffer (M9.1).
@@ -34,10 +35,11 @@ pub fn matvec(bytes: &[u8], dtype: GgmlType, x: &[f32], out: &mut [f32], rows: u
     let per_row = |(m, o): (usize, &mut f32)| {
         let row = &bytes[m * row_bytes..(m + 1) * row_bytes];
         let mut sum = 0.0f32;
-        let mut block = [0.0f32; QK];
-        for (b, xb) in row.chunks_exact(bb).zip(x.chunks_exact(QK)) {
-            dtype.dequantize(b, &mut block);
-            sum += dot(&block, xb);
+        let mut buf = [0.0f32; QK_K]; // sized for the largest block (Q6_K)
+        let block = &mut buf[..be];
+        for (b, xb) in row.chunks_exact(bb).zip(x.chunks_exact(be)) {
+            dtype.dequantize(b, block);
+            sum += dot(block, xb);
         }
         *o = sum;
     };

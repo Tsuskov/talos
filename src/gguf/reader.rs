@@ -156,6 +156,13 @@ fn read_value(c: &mut Cursor, tag: u32) -> Result<MetaValue> {
                     }
                     Ok(MetaValue::ArrI32(v))
                 }
+                T_FLOAT32 => {
+                    let mut v = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        v.push(c.f32()?);
+                    }
+                    Ok(MetaValue::ArrF32(v))
+                }
                 other => bail!("unsupported array element type tag {other}"),
             }
         }
@@ -270,6 +277,12 @@ impl GgufFile {
     pub fn get_arr_i32(&self, key: &str) -> Option<&[i32]> {
         match self.meta.get(key)? {
             MetaValue::ArrI32(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+    pub fn get_arr_f32(&self, key: &str) -> Option<&[f32]> {
+        match self.meta.get(key)? {
+            MetaValue::ArrF32(v) => Some(v.as_slice()),
             _ => None,
         }
     }

@@ -70,7 +70,11 @@ fn run(args: &[String]) -> Result<()> {
     let mut model = Model::load(Path::new(model_path))?;
     let mut rng = StdRng::seed_from_u64(opts.seed.unwrap_or_else(rand::random));
 
-    let prompt_ids = model.tokenizer.encode(prompt);
+    let mut prompt_ids = Vec::new();
+    if model.tokenizer.add_bos() {
+        prompt_ids.push(model.tokenizer.bos());
+    }
+    prompt_ids.extend(model.tokenizer.encode(prompt));
     if prompt_ids.is_empty() {
         bail!("prompt encoded to zero tokens");
     }

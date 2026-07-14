@@ -19,7 +19,8 @@ pub mod reader;
 pub use dtype::GgmlType;
 pub use reader::{GgufFile, TensorInfo};
 
-/// A parsed GGUF metadata value. Only the variants Hephaistos emits are modeled.
+/// A parsed GGUF metadata value. Covers the variants Hephaistos emits plus the
+/// `ArrF32` scores array that SentencePiece (llama-kind) tokenizers carry.
 #[derive(Clone, Debug)]
 pub enum MetaValue {
     U32(u32),
@@ -28,4 +29,5 @@ pub enum MetaValue {
     Str(String),
     ArrStr(Vec<String>),
     ArrI32(Vec<i32>),
+    ArrF32(Vec<f32>),
 }
