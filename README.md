@@ -74,6 +74,11 @@ talos run models/tiny.gguf --prompt "Once upon a time" -n 128 --temp 0.8
 talos perplexity models/tiny.gguf corpus.txt   # the honest quality number
 ```
 
+`run` sizes its KV cache to `--ctx` positions (default **4096**). A model's own
+`context_length` sizes the GPU KV buffers — Mistral's 32768 is ~8.6 GB across 32
+layers, which a short generation never uses — so the default caps it; raise
+`--ctx` (up to the model's context) for longer runs.
+
 Build with `cargo build --release --features metal` to run matvec on the GPU
 (Apple Silicon). The default build is CPU-only.
 
