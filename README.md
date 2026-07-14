@@ -86,7 +86,7 @@ Build with `cargo build --release --features metal` to run matvec on the GPU
 
 ```
 src/gguf/      GGUF v3 reader (header, metadata, tensor index)
-src/tokenizer  byte-level BPE
+src/tokenizer  byte-level BPE (gpt2) + SentencePiece (llama)
 src/math/      rmsnorm, rope, softmax, swiglu, matvec
 src/math/metal Metal GPU backend: matvec + whole forward (opt-in, M7–M8.2)
 src/model/     config, weight handles, Llama forward pass
